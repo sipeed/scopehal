@@ -68,16 +68,25 @@ void RemoteBridgeOscilloscope::StartSingleTrigger()
 
 void RemoteBridgeOscilloscope::Stop()
 {
-	m_transport->SendCommandQueued("STOP");
+	// Must use Immediate (not Queued) because Stop() is called from the GUI thread
+	// while InstrumentThread may be blocked in AcquireData() waiting for data socket.
+	// Queued commands only flush via BackgroundProcessing() which can't run during that block.
+	m_transport->SendCommandImmediate("STOP");
 
 	m_triggerArmed = false;
 }
 
 void RemoteBridgeOscilloscope::ForceTrigger()
 {
-	m_transport->SendCommandQueued("FORCE");
+	// Same as Stop(): must bypass queue to reach bridge immediately during trigger wait
+	m_transport->SendCommandImmediate("FORCE");
+
+	// Only treat FORCE as one-shot if we were stopped. If continuous (START) or
+	// SINGLE was already armed, preserve the existing one-shot mode so the
+	// client/server state machines stay in sync after the forced capture.
+	if(!m_triggerArmed)
+		m_triggerOneShot = true;
 	m_triggerArmed = true;
-	m_triggerOneShot = true;
 }
 
 void RemoteBridgeOscilloscope::PullTrigger()
