@@ -46,7 +46,6 @@ SigrokOscilloscope::SigrokOscilloscope(SCPITransport* transport)
 	: SCPIDevice(transport)
 	, SCPIInstrument(transport)
 	, RemoteBridgeOscilloscope(transport, true)
-	, m_adcMode(0)
 	, m_analogChannelCount(0)
 	, m_digitalChannelBase(0)
 	, m_digitalChannelCount(0)
@@ -69,11 +68,20 @@ SigrokOscilloscope::SigrokOscilloscope(SCPITransport* transport)
 
 	AddDiagnosticLog("Found Model: " + m_model);
 
-	//Set safe initial defaults (actual available rates/depths are queried dynamically by the UI)
-	SetSampleRate(1000000);
-	SetSampleDepth(10000);
+	//Query available rates/depths and set the first available as the initial
+	//value. Using a hardcoded default (like 1MHz) that isn't in the device's
+	//supported list causes GetSampleRate() != GetTimebaseInfo().GetRate()
+	//every frame, triggering infinite RATES?/DEPTHS? re-queries.
+	{
+		auto rates = GetSampleRatesNonInterleaved();
+		auto depths = GetSampleDepthsNonInterleaved();
+		if(!rates.empty())
+			SetSampleRate(rates[0]);
+		if(!depths.empty())
+			SetSampleDepth(depths[0]);
+	}
 
-	//Add analog channel objects
+	//Add analog channel objects (only present when bridge is in analog ADC mode)
 	for(size_t i = 0; i < m_analogChannelCount; i++)
 	{
 		string chname = "A" + to_string(i);
@@ -88,15 +96,14 @@ SigrokOscilloscope::SigrokOscilloscope(SCPITransport* transport)
 			i);
 		m_channels.push_back(chan);
 
-		//Set initial configuration so we have a well-defined instrument state
 		m_channelAttenuations[i] = 10;
 		SetChannelCoupling(i, OscilloscopeChannel::COUPLE_AC_1M);
 		SetChannelOffset(i, 0, 0);
 		SetChannelVoltageRange(i, 0, 5);
-		//Don't enable analog channels in digital mode (m_adcMode starts at 0)
+		EnableChannel(i);
 	}
 
-	//Add digital channel objects
+	//Add digital channel objects (only present when bridge is in digital ADC mode)
 	for(size_t i = 0; i < m_digitalChannelCount; i++)
 	{
 		size_t chnum = m_digitalChannelBase + i;
@@ -133,10 +140,16 @@ SigrokOscilloscope::SigrokOscilloscope(SCPITransport* transport)
 		m_digitalBanks.push_back(bank);
 	}
 
-	//Configure the trigger
+	//Configure the trigger on the first channel.
+	//In analog mode, default to mid-scale (attenuation/2) so the software
+	//trigger actually detects crossings. Level 0 maps to threshold_raw=0
+	//which makes every sample "above" and no rising edge is ever found.
 	auto trig = new EdgeTrigger(this);
 	trig->SetType(EdgeTrigger::EDGE_RISING);
-	trig->SetLevel(0);
+	if(m_analogChannelCount > 0 && m_digitalChannelCount == 0)
+		trig->SetLevel(m_channelAttenuations[0] / 2.0);
+	else
+		trig->SetLevel(0);
 	trig->SetInput(0, StreamDescriptor(GetOscilloscopeChannel(0)));
 	SetTrigger(trig);
 	SetTriggerOffset(1000000000000); //1ms to allow trigphase interpolation
@@ -211,11 +224,6 @@ void SigrokOscilloscope::IdentifyHardware()
 		{
 			m_analogChannelCount = ret[0];
 			m_digitalChannelCount = ret[1];
-
-			//If we have no analog channels, but have digital, assume we can use them as 8-bit analog ADCs
-			if(m_analogChannelCount == 0)
-				m_analogChannelCount = m_digitalChannelCount / 8;
-
 			m_digitalChannelBase = m_analogChannelCount;
 		}
 	}
@@ -232,13 +240,8 @@ unsigned int SigrokOscilloscope::GetInstrumentTypes() const
 	return Instrument::INST_OSCILLOSCOPE;
 }
 
-uint32_t SigrokOscilloscope::GetInstrumentTypesForChannel(size_t i) const
+uint32_t SigrokOscilloscope::GetInstrumentTypesForChannel(size_t /*i*/) const
 {
-	if(m_adcMode == 1 && i >= m_analogChannelCount)
-		return 0;
-	if(m_adcMode == 0 && i < m_analogChannelCount)
-		return 0;
-
 	return Instrument::INST_OSCILLOSCOPE;
 }
 
@@ -341,7 +344,7 @@ bool SigrokOscilloscope::AcquireData()
 	double t = GetTime();
 	int64_t fs = (t - floor(t)) * FS_PER_SECOND;
 
-	if(m_adcMode == 1)
+	if(m_analogChannelCount > 0 && m_digitalChannelCount == 0)
 	{
 		//Analog mode: reinterpret packed digital data as 8-bit ADC values
 		uint32_t numAnalogChannels = numChannels / 8;
@@ -657,38 +660,26 @@ Oscilloscope::AnalogBank SigrokOscilloscope::GetAnalogBank(size_t i)
 
 bool SigrokOscilloscope::IsADCModeConfigurable()
 {
-	return true;
+	return false;
 }
 
 vector<string> SigrokOscilloscope::GetADCModeNames(size_t /*channel*/)
 {
-	vector<string> ret;
-	ret.push_back("Digital");
-	ret.push_back("8-bit Analog");
-	return ret;
+	//ADC mode is fixed at bridge startup — not switchable from the client.
+	//Return a single entry so the UI shows current mode without a dropdown.
+	if(m_analogChannelCount > 0 && m_digitalChannelCount == 0)
+		return {"8-bit Analog"};
+	return {"Digital"};
 }
 
 size_t SigrokOscilloscope::GetADCMode(size_t /*channel*/)
 {
-	return m_adcMode;
+	return (m_analogChannelCount > 0 && m_digitalChannelCount == 0) ? 1 : 0;
 }
 
-void SigrokOscilloscope::SetADCMode(size_t /*channel*/, size_t mode)
+void SigrokOscilloscope::SetADCMode(size_t /*channel*/, size_t /*mode*/)
 {
-	m_adcMode = mode;
-
-	//Notify the bridge of the mode change
-	{
-		lock_guard<recursive_mutex> lock(m_mutex);
-		m_transport->SendCommandQueued("ADC:MODE " + to_string(mode));
-	}
-
-	//Disable channels that are no longer valid in the new mode
-	for(size_t i = 0; i < m_channels.size(); i++)
-	{
-		if(!CanEnableChannel(i))
-			m_channelsEnabled[i] = false;
-	}
+	//No-op: ADC mode is determined by bridge --adc-mode flag at startup.
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -749,12 +740,9 @@ void SigrokOscilloscope::SetDigitalThreshold(size_t i, float level)
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Checking for validity of configurations
 
-bool SigrokOscilloscope::CanEnableChannel(size_t i)
+bool SigrokOscilloscope::CanEnableChannel(size_t /*i*/)
 {
-	if(m_adcMode == 1 && i >= m_analogChannelCount)
-		return false;
-	if(m_adcMode == 0 && i < m_analogChannelCount)
-		return false;
-
+	//All channels are valid — mode is fixed at bridge startup, and only the
+	//appropriate channel types are created based on CHANS? response.
 	return true;
 }
