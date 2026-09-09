@@ -59,6 +59,7 @@
 #include "RSRTO6Oscilloscope.h"
 #include "SCPIPowerSupply.h"
 #include "SiglentSCPIOscilloscope.h"
+#include "SigrokOscilloscope.h"
 #include "TektronixOscilloscope.h"
 #include "TektronixHSIOscilloscope.h"
 #include "ThunderScopeOscilloscope.h"
@@ -319,6 +320,7 @@ void DriverStaticInit()
 	AddDriverClass(LeCroyFWPOscilloscope);
 	AddDriverClass(MagnovaOscilloscope);
 	AddDriverClass(SiglentSCPIOscilloscope);
+	AddDriverClass(SigrokOscilloscope);
 	AddDriverClass(TektronixOscilloscope);
 	AddDriverClass(TektronixHSIOscilloscope);
 	AddDriverClass(ThunderScopeOscilloscope);
