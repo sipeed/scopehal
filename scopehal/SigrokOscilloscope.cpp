@@ -301,6 +301,16 @@ Oscilloscope::TriggerMode SigrokOscilloscope::PollTrigger()
 
 bool SigrokOscilloscope::AcquireData()
 {
+	//Flush pending START/SINGLE and configuration commands, then wait for a reply
+	//on the command socket. This is the ordering barrier before requesting data
+	//on the independent waveform socket.
+	auto armed = Trim(m_transport->SendCommandQueuedWithReply("ARMED?"));
+	if(armed != "1")
+	{
+		LogTrace("Bridge is not armed, skipping waveform request\n");
+		return false;
+	}
+
 	//Signal to the bridge that we're ready for the next waveform
 	const uint8_t r = 'K';
 	m_transport->SendRawData(1, &r);
@@ -318,6 +328,19 @@ bool SigrokOscilloscope::AcquireData()
 	if(!m_transport->ReadRawData(sizeof(fs_per_sample), (uint8_t*)&fs_per_sample)) return false;
 	if(!m_transport->ReadRawData(sizeof(trigger_fs), (uint8_t*)&trigger_fs)) return false;
 
+	double wfms_s;
+	if(!m_transport->ReadRawData(sizeof(wfms_s), (uint8_t*)&wfms_s)) return false;
+
+	//A zero-sample response means "no waveform this time" (trigger hasn't
+	//fired yet, or acquisition was interrupted). Keep the previous waveform,
+	//don't touch trigger offset, and don't disarm a one-shot arm — the next
+	//polling loop will retry.
+	if(numSamples == 0)
+	{
+		LogTrace("Bridge reported empty frame (SEQ#%u), trigger not fired yet\n", seqnum);
+		return false;
+	}
+
 	{
 		lock_guard<recursive_mutex> lock(m_mutex);
 		if(m_triggerOffset != trigger_fs)
@@ -327,8 +350,6 @@ bool SigrokOscilloscope::AcquireData()
 		}
 	}
 
-	double wfms_s;
-	if(!m_transport->ReadRawData(sizeof(wfms_s), (uint8_t*)&wfms_s)) return false;
 	m_diag_hardwareWFMHz.SetFloatVal(wfms_s);
 
 	LogDebug("Receive header: SEQ#%u, %uch@%llu samples\n", seqnum, numChannels,
