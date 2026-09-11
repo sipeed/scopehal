@@ -119,6 +119,7 @@ SigrokOscilloscope::SigrokOscilloscope(SCPITransport* transport)
 			chnum);
 		m_channels.push_back(chan);
 
+		m_channelAttenuations[chnum] = 1;
 		SetDigitalHysteresis(chnum, 0.1);
 		SetDigitalThreshold(chnum, 1.6);
 		EnableChannel(chnum);
