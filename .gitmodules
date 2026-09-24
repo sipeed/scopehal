@@ -1,12 +1,12 @@
 [submodule "xptools"]
 	path = xptools
-	url = ../xptools.git
+	url = https://github.com/ngscopeclient/xptools.git
 [submodule "log"]
 	path = log
-	url = ../logtools.git
+	url = https://github.com/ngscopeclient/logtools.git
 [submodule "VkFFT"]
 	path = VkFFT
-	url = ../VkFFT.git
+	url = https://github.com/ngscopeclient/VkFFT.git
 [submodule "canvas_ity"]
 	path = canvas_ity
 	url = https://github.com/a-e-k/canvas_ity.git
