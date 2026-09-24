@@ -81,73 +81,133 @@ SigrokOscilloscope::SigrokOscilloscope(SCPITransport* transport)
 			SetSampleDepth(depths[0]);
 	}
 
-	//Add analog channel objects (only present when bridge is in analog ADC mode)
-	for(size_t i = 0; i < m_analogChannelCount; i++)
+	if(!m_groupLayout.empty())
 	{
-		string chname = "A" + to_string(i);
+		//Flexible per-byte-group layout: create channels group by group, assigning stable unique
+		//indices in creation order (0..total-1). An A group makes one analog channel occupying the
+		//whole byte; a D group makes 8 digital channels, one per bit of the byte.
+		size_t nextChannel = 0;
+		for(auto& g : m_groupLayout)
+		{
+			if(g.analog)
+			{
+				size_t idx = nextChannel++;
+				auto chan = new OscilloscopeChannel(
+					this,
+					g.name,
+					GetChannelColor(idx),
+					Unit(Unit::UNIT_FS),
+					Unit(Unit::UNIT_VOLTS),
+					Stream::STREAM_TYPE_ANALOG,
+					idx);
+				m_channels.push_back(chan);
 
-		auto chan = new OscilloscopeChannel(
-			this,
-			chname,
-			GetChannelColor(i),
-			Unit(Unit::UNIT_FS),
-			Unit(Unit::UNIT_VOLTS),
-			Stream::STREAM_TYPE_ANALOG,
-			i);
-		m_channels.push_back(chan);
+				m_channelAttenuations[idx] = 10;
+				SetChannelCoupling(idx, OscilloscopeChannel::COUPLE_AC_1M);
+				SetChannelOffset(idx, 0, 0);
+				SetChannelVoltageRange(idx, 0, 5);
+				EnableChannel(idx);
+			}
+			else
+			{
+				for(size_t k = 0; k < 8; k++)
+				{
+					size_t idx = nextChannel++;
+					string chname = "D" + to_string(8 * g.byteOffset + k);
 
-		m_channelAttenuations[i] = 10;
-		SetChannelCoupling(i, OscilloscopeChannel::COUPLE_AC_1M);
-		SetChannelOffset(i, 0, 0);
-		SetChannelVoltageRange(i, 0, 5);
-		EnableChannel(i);
+					auto chan = new OscilloscopeChannel(
+						this,
+						chname,
+						GetChannelColor(idx),
+						Unit(Unit::UNIT_FS),
+						Unit(Unit::UNIT_COUNTS),
+						Stream::STREAM_TYPE_DIGITAL,
+						idx);
+					m_channels.push_back(chan);
+
+					m_channelAttenuations[idx] = 1;
+					SetDigitalHysteresis(idx, 0.1);
+					SetDigitalThreshold(idx, 1.6);
+					EnableChannel(idx);
+				}
+			}
+		}
 	}
-
-	//Add digital channel objects (only present when bridge is in digital ADC mode)
-	for(size_t i = 0; i < m_digitalChannelCount; i++)
+	else
 	{
-		size_t chnum = m_digitalChannelBase + i;
-		string chname = "D" + to_string(i);
-
-		auto chan = new OscilloscopeChannel(
-			this,
-			chname,
-			GetChannelColor(i),
-			Unit(Unit::UNIT_FS),
-			Unit(Unit::UNIT_COUNTS),
-			Stream::STREAM_TYPE_DIGITAL,
-			chnum);
-		m_channels.push_back(chan);
-
-		m_channelAttenuations[chnum] = 1;
-		SetDigitalHysteresis(chnum, 0.1);
-		SetDigitalThreshold(chnum, 1.6);
-		EnableChannel(chnum);
-	}
-
-	//Set up analog and digital banks
-	if(m_analogChannelCount > 0)
-	{
-		AnalogBank bank;
+		//Add analog channel objects (only present when bridge is in analog ADC mode)
 		for(size_t i = 0; i < m_analogChannelCount; i++)
-			bank.push_back(GetOscilloscopeChannel(i));
-		m_analogBanks.push_back(bank);
-	}
-	if(m_digitalChannelCount > 0)
-	{
-		DigitalBank bank;
+		{
+			string chname = "A" + to_string(i);
+
+			auto chan = new OscilloscopeChannel(
+				this,
+				chname,
+				GetChannelColor(i),
+				Unit(Unit::UNIT_FS),
+				Unit(Unit::UNIT_VOLTS),
+				Stream::STREAM_TYPE_ANALOG,
+				i);
+			m_channels.push_back(chan);
+
+			m_channelAttenuations[i] = 10;
+			SetChannelCoupling(i, OscilloscopeChannel::COUPLE_AC_1M);
+			SetChannelOffset(i, 0, 0);
+			SetChannelVoltageRange(i, 0, 5);
+			EnableChannel(i);
+		}
+
+		//Add digital channel objects (only present when bridge is in digital ADC mode)
 		for(size_t i = 0; i < m_digitalChannelCount; i++)
-			bank.push_back(GetOscilloscopeChannel(m_digitalChannelBase + i));
-		m_digitalBanks.push_back(bank);
+		{
+			size_t chnum = m_digitalChannelBase + i;
+			string chname = "D" + to_string(i);
+
+			auto chan = new OscilloscopeChannel(
+				this,
+				chname,
+				GetChannelColor(i),
+				Unit(Unit::UNIT_FS),
+				Unit(Unit::UNIT_COUNTS),
+				Stream::STREAM_TYPE_DIGITAL,
+				chnum);
+			m_channels.push_back(chan);
+
+			m_channelAttenuations[chnum] = 1;
+			SetDigitalHysteresis(chnum, 0.1);
+			SetDigitalThreshold(chnum, 1.6);
+			EnableChannel(chnum);
+		}
+	}
+
+	//Set up analog and digital banks from the created channels (works for both layout and fallback).
+	{
+		AnalogBank abank;
+		DigitalBank dbank;
+		for(size_t i = 0; i < m_channels.size(); i++)
+		{
+			auto chan = GetOscilloscopeChannel(i);
+			if(!chan)
+				continue;
+			if(chan->GetType(0) == Stream::STREAM_TYPE_ANALOG)
+				abank.push_back(chan);
+			else if(chan->GetType(0) == Stream::STREAM_TYPE_DIGITAL)
+				dbank.push_back(chan);
+		}
+		if(!abank.empty())
+			m_analogBanks.push_back(abank);
+		if(!dbank.empty())
+			m_digitalBanks.push_back(dbank);
 	}
 
 	//Configure the trigger on the first channel.
-	//In analog mode, default to mid-scale (attenuation/2) so the software
+	//For an analog first channel, default to mid-scale (attenuation/2) so the software
 	//trigger actually detects crossings. Level 0 maps to threshold_raw=0
 	//which makes every sample "above" and no rising edge is ever found.
 	auto trig = new EdgeTrigger(this);
 	trig->SetType(EdgeTrigger::EDGE_RISING);
-	if(m_analogChannelCount > 0 && m_digitalChannelCount == 0)
+	auto firstChan = GetOscilloscopeChannel(0);
+	if(firstChan && firstChan->GetType(0) == Stream::STREAM_TYPE_ANALOG)
 		trig->SetLevel(m_channelAttenuations[0] / 2.0);
 	else
 		trig->SetLevel(0);
@@ -200,9 +260,61 @@ void SigrokOscilloscope::IdentifyHardware()
 	m_analogChannelCount = 0;
 	m_digitalChannelBase = 0;
 	m_digitalChannelCount = 0;
+	m_groupLayout.clear();
 
 	LogDebug("ID Model \"%s\"\n", m_model.c_str());
 
+	//First try the flexible per-byte-group layout query. A server that supports it replies with a
+	//comma-separated descriptor list "<byteOffset>:<A|D>:<name>" covering every byte 0..N-1.
+	{
+		lock_guard<recursive_mutex> lock(m_mutex);
+		string layout;
+		try
+		{
+			layout = m_transport->SendCommandQueuedWithReply("LAYOUT?");
+		}
+		catch(...)
+		{
+			layout = "";
+		}
+
+		if(ParseLayout(layout))
+		{
+			//Create digital channels before analog so ngscopeclient's connect-time layout gives
+			//them their own waveform area instead of overlaying them onto the first analog area
+			//(WaveformArea::IsCompatible allows a digital stream on any time-base area, so the
+			//first analog area would otherwise swallow every digital channel). Stable so the
+			//byte order within each type — and thus D<n> numbering — is preserved.
+			std::stable_sort(m_groupLayout.begin(), m_groupLayout.end(),
+				[](const ChannelGroup& a, const ChannelGroup& b) { return !a.analog && b.analog; });
+
+			//Derive legacy counts for banks/mode reporting. Digital channels are 8 per digital byte.
+			size_t nextChannel = 0;
+			for(auto& g : m_groupLayout)
+			{
+				g.firstChannel = nextChannel;
+				if(g.analog)
+				{
+					m_analogChannelCount++;
+					nextChannel += 1;
+				}
+				else
+				{
+					m_digitalChannelCount += 8;
+					nextChannel += 8;
+				}
+			}
+			//m_digitalChannelBase is only meaningful for the fallback path; in layout mode each
+			//group carries its own firstChannel. Point it at the first digital channel if any.
+			m_digitalChannelBase = m_analogChannelCount;
+
+			LogDebug("LAYOUT? described %zu byte groups (%zu analog channels, %zu digital channels)\n",
+				m_groupLayout.size(), m_analogChannelCount, m_digitalChannelCount);
+			return;
+		}
+	}
+
+	//Fall back to the legacy 2-count CHANS? query (all-analog or all-digital).
 	{
 		lock_guard<recursive_mutex> lock(m_mutex);
 		auto chans = m_transport->SendCommandQueuedWithReply("CHANS?");
@@ -231,6 +343,80 @@ void SigrokOscilloscope::IdentifyHardware()
 
 	LogDebug("Detected %zu analog channels and %zu digital channels\n",
 		m_analogChannelCount, m_digitalChannelCount);
+}
+
+/**
+	@brief Parse a LAYOUT? reply into m_groupLayout.
+
+	Reply format: comma-separated "<byteOffset>:<A|D>:<name>" descriptors, ascending byteOffset,
+	covering all bytes 0..N-1. Returns true on a well-formed non-empty reply, false otherwise
+	(so the caller can fall back to CHANS?). On failure m_groupLayout is left empty.
+ */
+bool SigrokOscilloscope::ParseLayout(const string& reply)
+{
+	m_groupLayout.clear();
+
+	string trimmed = Trim(reply);
+	if(trimmed.empty())
+		return false;
+
+	vector<ChannelGroup> groups;
+	stringstream ss(trimmed);
+	string token;
+	while(getline(ss, token, ','))
+	{
+		if(token.empty())
+			continue;
+
+		//Split "<byteOffset>:<A|D>:<name>" into exactly three fields.
+		auto c1 = token.find(':');
+		if(c1 == string::npos)
+			return false;
+		auto c2 = token.find(':', c1 + 1);
+		if(c2 == string::npos)
+			return false;
+
+		string offStr = token.substr(0, c1);
+		string typeStr = token.substr(c1 + 1, c2 - (c1 + 1));
+		string name = token.substr(c2 + 1);
+
+		if(offStr.empty() || name.empty() || typeStr.size() != 1)
+			return false;
+
+		ChannelGroup g;
+		try
+		{
+			g.byteOffset = static_cast<size_t>(stoul(offStr));
+		}
+		catch(...)
+		{
+			return false;
+		}
+
+		if(typeStr[0] == 'A' || typeStr[0] == 'a')
+			g.analog = true;
+		else if(typeStr[0] == 'D' || typeStr[0] == 'd')
+			g.analog = false;
+		else
+			return false;
+
+		g.name = name;
+		g.firstChannel = 0;
+		groups.push_back(g);
+	}
+
+	if(groups.empty())
+		return false;
+
+	//Descriptors must be ascending and cover every byte 0..N-1 with no gaps.
+	for(size_t i = 0; i < groups.size(); i++)
+	{
+		if(groups[i].byteOffset != i)
+			return false;
+	}
+
+	m_groupLayout = std::move(groups);
+	return true;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -366,7 +552,148 @@ bool SigrokOscilloscope::AcquireData()
 	double t = GetTime();
 	int64_t fs = (t - floor(t)) * FS_PER_SECOND;
 
-	if(m_analogChannelCount > 0 && m_digitalChannelCount == 0)
+	if(!m_groupLayout.empty())
+	{
+		//Flexible layout mode: route each byte of every sample according to the cached LAYOUT?
+		//descriptors. Analog byte groups become one UniformAnalogWaveform each; digital byte groups
+		//bit-expand into 8 SparseDigitalWaveforms each.
+		size_t totalCh = m_channels.size();
+
+		//RLE state for digital channels (indexed by global channel index; analog slots go unused).
+		vector< vector<int64_t> > rle_offsets(totalCh);
+		vector< vector<int64_t> > rle_durations(totalCh);
+		vector< vector<uint8_t> > rle_samples(totalCh);
+		vector<uint8_t> last_val(totalCh, 0);
+		vector<int64_t> last_start(totalCh, 0);
+
+		//Create waveforms up front.
+		for(auto& g : m_groupLayout)
+		{
+			if(g.analog)
+			{
+				auto cap = new UniformAnalogWaveform;
+				s[GetOscilloscopeChannel(g.firstChannel)] = cap;
+				cap->m_timescale = fs_per_sample;
+				cap->m_triggerPhase = 0;
+				cap->m_startTimestamp = time(NULL);
+				cap->m_startFemtoseconds = fs;
+				cap->PrepareForCpuAccess();
+				cap->Resize(numSamples);
+			}
+			else
+			{
+				for(size_t k = 0; k < 8; k++)
+				{
+					auto cap = new SparseDigitalWaveform;
+					s[GetOscilloscopeChannel(g.firstChannel + k)] = cap;
+					cap->m_timescale = fs_per_sample;
+					cap->m_triggerPhase = 0;
+					cap->m_startTimestamp = time(NULL);
+					cap->m_startFemtoseconds = fs;
+				}
+			}
+		}
+
+		for(uint64_t numSamples_recved = 0; numSamples_recved < numSamples;)
+		{
+			uint64_t samples_to_read = min((uint64_t)CHUNK_SAMPLES, numSamples - numSamples_recved);
+			uint64_t bytes_to_read = samples_to_read * unit_size;
+
+			if(!m_transport->ReadRawData(bytes_to_read, raw_buffer.data()))
+			{
+				LogWarning("Incomplete data read, expected %llu samples, got %llu samples\n",
+					static_cast<unsigned long long>(numSamples),
+					static_cast<unsigned long long>(numSamples_recved));
+				numSamples = numSamples_recved;
+				break;
+			}
+
+			for(size_t i = 0; i < samples_to_read; i++)
+			{
+				int64_t global_index = numSamples_recved + i;
+				size_t base = i * unit_size;
+
+				for(auto& g : m_groupLayout)
+				{
+					uint8_t byteval = raw_buffer[base + g.byteOffset];
+
+					if(g.analog)
+					{
+						size_t idx = g.firstChannel;
+						auto cap = static_cast<UniformAnalogWaveform*>(s[GetOscilloscopeChannel(idx)]);
+						float range = m_channelAttenuations[idx];
+						// Sample value is the true signal voltage only. The channel
+						// offset is a DISPLAY parameter applied by the renderer
+						// (GetOffset); baking it into the samples here would move the
+						// data itself when the user drags the vertical position.
+						cap->m_samples[global_index] = (byteval / 255.0f) * range;
+					}
+					else
+					{
+						for(size_t k = 0; k < 8; k++)
+						{
+							size_t idx = g.firstChannel + k;
+							uint8_t bit = (byteval >> k) & 1;
+
+							if(global_index == 0)
+							{
+								last_val[idx] = bit;
+								last_start[idx] = global_index;
+							}
+							else if(bit != last_val[idx])
+							{
+								rle_offsets[idx].push_back(last_start[idx]);
+								rle_durations[idx].push_back(global_index - last_start[idx]);
+								rle_samples[idx].push_back(last_val[idx]);
+
+								last_val[idx] = bit;
+								last_start[idx] = global_index;
+							}
+						}
+					}
+				}
+			}
+
+			numSamples_recved += samples_to_read;
+		}
+
+		//Finish: flush analog, and flush the last RLE run for each digital channel.
+		for(auto& g : m_groupLayout)
+		{
+			if(g.analog)
+			{
+				auto cap = static_cast<UniformAnalogWaveform*>(s[GetOscilloscopeChannel(g.firstChannel)]);
+				cap->MarkSamplesModifiedFromCpu();
+			}
+			else
+			{
+				for(size_t k = 0; k < 8; k++)
+				{
+					size_t idx = g.firstChannel + k;
+
+					rle_offsets[idx].push_back(last_start[idx]);
+					rle_durations[idx].push_back(numSamples - last_start[idx]);
+					rle_samples[idx].push_back(last_val[idx]);
+
+					auto cap = static_cast<SparseDigitalWaveform*>(s[GetOscilloscopeChannel(idx)]);
+					size_t memdepth = rle_offsets[idx].size();
+
+					cap->PrepareForCpuAccess();
+					cap->Resize(memdepth);
+
+					memcpy(cap->m_offsets.GetCpuPointer(), rle_offsets[idx].data(), memdepth * sizeof(int64_t));
+					memcpy(cap->m_durations.GetCpuPointer(), rle_durations[idx].data(), memdepth * sizeof(int64_t));
+
+					for(size_t j = 0; j < memdepth; j++)
+						cap->m_samples[j] = rle_samples[idx][j] ? true : false;
+
+					cap->MarkSamplesModifiedFromCpu();
+					cap->MarkTimestampsModifiedFromCpu();
+				}
+			}
+		}
+	}
+	else if(m_analogChannelCount > 0 && m_digitalChannelCount == 0)
 	{
 		//Analog mode: reinterpret packed digital data as 8-bit ADC values
 		uint32_t numAnalogChannels = numChannels / 8;
@@ -405,8 +732,9 @@ bool SigrokOscilloscope::AcquireData()
 					auto cap = static_cast<UniformAnalogWaveform*>(s[GetOscilloscopeChannel(chnum)]);
 
 					float range = m_channelAttenuations[chnum];
-					float offset = m_channelOffsets[chnum];
-					cap->m_samples[numSamples_recved + i] = (raw_val / 255.0f) * range + offset;
+					// Sample value is the true signal voltage only; the channel
+					// offset is applied by the renderer (see the layout path).
+					cap->m_samples[numSamples_recved + i] = (raw_val / 255.0f) * range;
 				}
 			}
 
@@ -691,12 +1019,15 @@ vector<string> SigrokOscilloscope::GetADCModeNames(size_t /*channel*/)
 	//Return a single entry so the UI shows current mode without a dropdown.
 	if(m_analogChannelCount > 0 && m_digitalChannelCount == 0)
 		return {"8-bit Analog"};
+	if(m_analogChannelCount > 0 && m_digitalChannelCount > 0)
+		return {"Mixed"};
 	return {"Digital"};
 }
 
 size_t SigrokOscilloscope::GetADCMode(size_t /*channel*/)
 {
-	return (m_analogChannelCount > 0 && m_digitalChannelCount == 0) ? 1 : 0;
+	//Single fixed mode; report 1 if any analog channels are present, else 0 (all-digital).
+	return (m_analogChannelCount > 0) ? 1 : 0;
 }
 
 void SigrokOscilloscope::SetADCMode(size_t /*channel*/, size_t /*mode*/)

@@ -105,12 +105,24 @@ public:
 
 protected:
 	void IdentifyHardware();
+	bool ParseLayout(const std::string& reply);
 	void ResetPerCaptureDiagnostics();
 	std::string GetChannelColor(size_t i);
 
 	size_t m_analogChannelCount;
 	size_t m_digitalChannelBase;
 	size_t m_digitalChannelCount;
+
+	///@brief One descriptor per byte in a sample (from the LAYOUT? query).
+	/// Empty when the bridge does not support LAYOUT? and we fall back to CHANS?.
+	struct ChannelGroup
+	{
+		bool analog;			//true: 1 analog channel occupying the byte; false: 8 digital channels (the 8 bits)
+		size_t byteOffset;		//which byte of each sample this group reads
+		std::string name;		//analog: channel name; digital: base name (unused for indexing, we derive D<8*off+k>)
+		size_t firstChannel;	//index of the first m_channels[] entry created for this group
+	};
+	std::vector<ChannelGroup> m_groupLayout;
 
 	std::vector<AnalogBank> m_analogBanks;
 	std::vector<DigitalBank> m_digitalBanks;
