@@ -90,10 +90,25 @@ SigrokOscilloscope::SigrokOscilloscope(SCPITransport* transport)
 	{
 		auto rates = GetSampleRatesNonInterleaved();
 		auto depths = GetSampleDepthsNonInterleaved();
+		//Default to a moderate 40 MS/s / 100 kS rather than the list's first
+		//entry, snapped to the nearest supported value so it is always in the
+		//advertised list (a value outside the list re-queries RATES?/DEPTHS?
+		//every frame; see above).
+		auto nearest = [](const vector<uint64_t>& vals, uint64_t target) -> uint64_t
+		{
+			uint64_t best = vals[0];
+			uint64_t bestDist = (best > target) ? (best - target) : (target - best);
+			for(auto v : vals)
+			{
+				uint64_t d = (v > target) ? (v - target) : (target - v);
+				if(d < bestDist) { bestDist = d; best = v; }
+			}
+			return best;
+		};
 		if(!rates.empty())
-			SetSampleRate(rates[0]);
+			SetSampleRate(nearest(rates, 40000000ULL));
 		if(!depths.empty())
-			SetSampleDepth(depths[0]);
+			SetSampleDepth(nearest(depths, 100000ULL));
 	}
 
 	if(!m_groupLayout.empty())
