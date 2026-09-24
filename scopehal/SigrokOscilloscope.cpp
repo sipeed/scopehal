@@ -39,6 +39,21 @@
 
 using namespace std;
 
+// SLogic digital channel palette: 8 colours per group, repeating every 8
+// channels (D8k+0..D8k+7): red, orange, yellow, green, brown, blue, white, grey.
+// Shared with PulseView / SLogicView / ALL-Logic.
+static const char* const g_slogicDigitalColors[8] =
+{
+	"#ff0000",	// Red
+	"#ff8000",	// Orange
+	"#ffe000",	// Yellow
+	"#00c000",	// Green
+	"#a0522d",	// Brown
+	"#2080ff",	// Blue
+	"#ffffff",	// White
+	"#a0a0a0",	// Grey
+};
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Construction / destruction
 
@@ -113,12 +128,13 @@ SigrokOscilloscope::SigrokOscilloscope(SCPITransport* transport)
 				for(size_t k = 0; k < 8; k++)
 				{
 					size_t idx = nextChannel++;
-					string chname = "D" + to_string(8 * g.byteOffset + k);
+					size_t dnum = 8 * g.byteOffset + k;
+					string chname = "D" + to_string(dnum);
 
 					auto chan = new OscilloscopeChannel(
 						this,
 						chname,
-						GetChannelColor(idx),
+						g_slogicDigitalColors[dnum % 8],
 						Unit(Unit::UNIT_FS),
 						Unit(Unit::UNIT_COUNTS),
 						Stream::STREAM_TYPE_DIGITAL,
@@ -166,7 +182,7 @@ SigrokOscilloscope::SigrokOscilloscope(SCPITransport* transport)
 			auto chan = new OscilloscopeChannel(
 				this,
 				chname,
-				GetChannelColor(i),
+				g_slogicDigitalColors[i % 8],
 				Unit(Unit::UNIT_FS),
 				Unit(Unit::UNIT_COUNTS),
 				Stream::STREAM_TYPE_DIGITAL,
