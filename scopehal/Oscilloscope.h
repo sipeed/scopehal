@@ -793,6 +793,24 @@ public:
 	 */
 	virtual void SetCaptureWidth(size_t mode);
 
+	/**
+		@brief Number of channel groups whose analog/digital mode can be selected, 0 if not supported.
+
+		Some logic analyzers can read a group of pins either as individual digital channels or as a
+		single analog value. This returns how many such groups are currently selectable.
+	 */
+	virtual size_t GetChannelGroupCount();
+
+	/**
+		@brief Returns true if the given channel group is in analog mode, false for digital.
+	 */
+	virtual bool IsChannelGroupAnalog(size_t group);
+
+	/**
+		@brief Sets a channel group to analog (true) or digital (false) mode.
+	 */
+	virtual void SetChannelGroupAnalog(size_t group, bool analog);
+
 	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	// Logic analyzer configuration
 

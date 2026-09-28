@@ -132,6 +132,9 @@ public:
 	virtual std::vector<std::string> GetCaptureWidthNames() override;
 	virtual size_t GetCaptureWidth() override;
 	virtual void SetCaptureWidth(size_t mode) override;
+	virtual size_t GetChannelGroupCount() override;
+	virtual bool IsChannelGroupAnalog(size_t group) override;
+	virtual void SetChannelGroupAnalog(size_t group, bool analog) override;
 	virtual std::vector<AnalogBank> GetAnalogBanks() override;
 	virtual AnalogBank GetAnalogBank(size_t channel) override;
 
@@ -156,6 +159,8 @@ protected:
 	void RebuildBanks();
 	///@brief Model channel-mode options (channel count + max rate), highest channel count first
 	std::vector<slogic_rate_limit> CaptureWidthOptions();
+	///@brief Retarget the edge trigger to the first enabled channel if its current channel is disabled
+	void RetargetTriggerIfNeeded();
 	///@brief Analog channel color by index
 	std::string GetChannelColor(size_t i);
 

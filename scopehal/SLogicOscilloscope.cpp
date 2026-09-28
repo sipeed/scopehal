@@ -59,6 +59,13 @@ static const char* const g_slogicDigitalColors[8] =
 	"#a0a0a0",	// Grey
 };
 
+//When a byte-group's 8 pins are shown as one analog channel, the 8-bit value maps LINEARLY to the
+//device's fixed ±15 V analog range (0 -> -15 V, 128 -> ~0 V, 255 -> +15 V). This mapping is a
+//physical property of the data and is independent of the display voltage range (V/div), so zooming
+//the vertical scale rescales the view without changing the sample values.
+static const float g_slogicAnalogVfs  = 15.0f;	//±full scale (volts)
+static const float g_slogicAnalogSpan = 30.0f;	//total span, g_slogicAnalogVfs * 2
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Construction / destruction
 
@@ -335,10 +342,10 @@ void SLogicOscilloscope::BuildChannels()
 				Stream::STREAM_TYPE_ANALOG,
 				idx);
 			m_channels.push_back(chan);
-			m_channelAttenuation[idx] = 10;
+			m_channelAttenuation[idx] = 1;	//1x = direct reading (±15 V); user picks 2x/etc. for an external probe
 			m_channelCoupling[idx] = OscilloscopeChannel::COUPLE_DC_50;
 			m_channelBandwidth[idx] = 0;
-			m_channelVoltageRange[idx] = 5;
+			m_channelVoltageRange[idx] = g_slogicAnalogSpan;	//show the full ±15 V by default
 			m_channelOffset[idx] = 0;
 		}
 		//8 digital channels D<8g+k>, one per bit
@@ -794,10 +801,13 @@ int64_t SLogicOscilloscope::FindTriggerSample(int unit)
 
 	if(analog)
 	{
-		//scopehal trigger level is volts; reshape maps byteval/255*range → volts, so raw = level/range*255
-		float range = m_channelVoltageRange.count(idx) ? m_channelVoltageRange[idx] : 5;
+		//scopehal trigger level is in displayed (post-attenuation) volts; reshape maps
+		//0..255 -> (-15..+15 V) × attenuation, so invert: raw = ((level/atten) + Vfs) / span * 255.
 		float lv = edge->GetLevel();
-		int rawi = (range > 0) ? (int)((lv / range) * 255.0f + 0.5f) : 128;
+		float atten = m_channelAttenuation.count(idx) ? (float)m_channelAttenuation[idx] : 1.0f;
+		if(atten == 0.0f)
+			atten = 1.0f;
+		int rawi = (int)((((lv / atten) + g_slogicAnalogVfs) / g_slogicAnalogSpan) * 255.0f + 0.5f);
 		rawi = std::max(0, std::min(255, rawi));
 		uint8_t thresh = (uint8_t)rawi;
 
@@ -910,7 +920,7 @@ void SLogicOscilloscope::ReshapeAndQueue()
 	//Active layout: byte g of each sample → group g (analog A<g> at g*9, else D<8g+k> at g*9+1..8).
 	//A partial last group emits only its valid low bits (e.g. 4 ch → D0..D3). Analog covers a whole
 	//byte, so a group is analog only when fully inside the capture width.
-	struct Grp { size_t byteOffset; bool analog; size_t firstChannel; size_t nbits; };
+	struct Grp { size_t byteOffset; bool analog; size_t firstChannel; size_t nbits; float atten; };
 	vector<Grp> layout;
 	for(size_t g=0; g<activeGroups; g++)
 	{
@@ -920,7 +930,9 @@ void SLogicOscilloscope::ReshapeAndQueue()
 		size_t nbits = (size_t)capCount - g*8;
 		if(nbits > 8)
 			nbits = 8;
-		layout.push_back({ g, analog, analog ? base : base+1, nbits });
+		//Probe attenuation for the analog view (A<g> at index base): displayed volts = raw × attenuation.
+		float atten = m_channelAttenuation.count(base) ? (float)m_channelAttenuation[base] : 1.0f;
+		layout.push_back({ g, analog, analog ? base : base+1, nbits, atten });
 	}
 
 	double t = GetTime();
@@ -973,8 +985,9 @@ void SLogicOscilloscope::ReshapeAndQueue()
 			{
 				size_t idx = g.firstChannel;
 				auto cap = static_cast<UniformAnalogWaveform*>(s[GetOscilloscopeChannel(idx)]);
-				float range = m_channelVoltageRange.count(idx) ? m_channelVoltageRange[idx] : 5;
-				cap->m_samples[i] = (byteval / 255.0f) * range;
+				//Fixed physical mapping (0..255 -> -15..+15 V) scaled by the probe attenuation, and
+				//independent of the display range so vertical zoom rescales the view, not the data.
+				cap->m_samples[i] = (-g_slogicAnalogVfs + (byteval / 255.0f) * g_slogicAnalogSpan) * g.atten;
 			}
 			else
 			{
@@ -1381,8 +1394,14 @@ void SLogicOscilloscope::SetCaptureWidth(size_t mode)
 	uint64_t maxRate = opts[mode].max_rate_hz;
 	m_channelCount = newCount;
 
-	//Increment 1 is all-digital; per-group analog selection lands in increment 2.
-	m_analogGroups.clear();
+	//Drop analog groups that are no longer fully inside the new width (analog covers a whole byte).
+	for(auto it = m_analogGroups.begin(); it != m_analogGroups.end(); )
+	{
+		if((*it * 8 + 8) > (size_t)newCount)
+			it = m_analogGroups.erase(it);
+		else
+			++it;
+	}
 
 	ApplyChannelEnables();
 	RebuildBanks();
@@ -1406,37 +1425,67 @@ void SLogicOscilloscope::SetCaptureWidth(size_t mode)
 		m_srate = best;
 	}
 
-	//If the trigger's channel is now disabled, retarget it to the first enabled channel.
-	auto edge = dynamic_cast<EdgeTrigger*>(GetTrigger());
-	if(edge)
-	{
-		auto in = edge->GetInput(0);
-		bool inputEnabled = false;
-		for(size_t i=0; i<m_channels.size(); i++)
-		{
-			if((in.m_channel == GetOscilloscopeChannel(i)) && IsChannelEnabled(i))
-			{
-				inputEnabled = true;
-				break;
-			}
-		}
-		if(!inputEnabled)
-		{
-			for(size_t i=0; i<m_channels.size(); i++)
-			{
-				if(IsChannelEnabled(i))
-				{
-					edge->SetInput(0, StreamDescriptor(GetOscilloscopeChannel(i)));
-					edge->SetLevel(0);
-					break;
-				}
-			}
-		}
-	}
+	RetargetTriggerIfNeeded();
 
 	m_lastTrigState = -1;	//trigger source/width changed: re-baseline the cross-buffer scan
 	LogDebug("SLogic: SetCaptureWidth -> %d ch (max %llu MHz)\n",
 		newCount, (unsigned long long)(maxRate / 1000000ULL));
+}
+
+size_t SLogicOscilloscope::GetChannelGroupCount()
+{
+	lock_guard<recursive_mutex> lock(m_mutex);
+	//Only fully-active byte-groups can be analog; a partial last group (e.g. 4 ch) offers no toggle.
+	return (size_t)(m_channelCount / 8);
+}
+
+bool SLogicOscilloscope::IsChannelGroupAnalog(size_t group)
+{
+	lock_guard<recursive_mutex> lock(m_mutex);
+	return m_analogGroups.count(group) > 0;
+}
+
+void SLogicOscilloscope::SetChannelGroupAnalog(size_t group, bool analog)
+{
+	lock_guard<recursive_mutex> lock(m_mutex);
+	//Analog covers a whole byte, so only a fully-active group can be toggled.
+	if((group * 8 + 8) > (size_t)m_channelCount)
+		return;
+	if(analog)
+		m_analogGroups.insert(group);
+	else
+		m_analogGroups.erase(group);
+
+	//Analog/digital only changes interpretation of the same captured byte, not the capture width,
+	//so no rate/re-plan change is needed — just re-enable channels and refresh banks + trigger.
+	ApplyChannelEnables();
+	RebuildBanks();
+	RetargetTriggerIfNeeded();
+	m_lastTrigState = -1;
+	LogDebug("SLogic: SetChannelGroupAnalog(group=%zu, %s)\n", group, analog ? "analog" : "digital");
+}
+
+//Retarget the edge trigger to the first enabled channel if its current input channel is disabled.
+void SLogicOscilloscope::RetargetTriggerIfNeeded()
+{
+	auto edge = dynamic_cast<EdgeTrigger*>(GetTrigger());
+	if(!edge)
+		return;
+	auto in = edge->GetInput(0);
+	for(size_t i=0; i<m_channels.size(); i++)
+	{
+		if((in.m_channel == GetOscilloscopeChannel(i)) && IsChannelEnabled(i))
+			return;	//still enabled, nothing to do
+	}
+	for(size_t i=0; i<m_channels.size(); i++)
+	{
+		if(IsChannelEnabled(i))
+		{
+			edge->SetInput(0, StreamDescriptor(GetOscilloscopeChannel(i)));
+			edge->SetLevel(0);
+			return;
+		}
+	}
 }
 
 //Enable/disable the physical channel set from m_channelCount + m_analogGroups, handling a partial

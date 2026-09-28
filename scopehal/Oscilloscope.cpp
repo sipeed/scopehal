@@ -946,6 +946,21 @@ void Oscilloscope::SetCaptureWidth(size_t /*mode*/)
 	//no-op
 }
 
+size_t Oscilloscope::GetChannelGroupCount()
+{
+	return 0;
+}
+
+bool Oscilloscope::IsChannelGroupAnalog(size_t /*group*/)
+{
+	return false;
+}
+
+void Oscilloscope::SetChannelGroupAnalog(size_t /*group*/, bool /*analog*/)
+{
+	//no-op
+}
+
 bool Oscilloscope::CanInvert(size_t /*i*/)
 {
 	return false;
