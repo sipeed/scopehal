@@ -25,6 +25,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	endif()
 endif()
 
+# libusb is required by the native SLogic logic-analyzer driver
+pkg_check_modules(LIBUSB libusb-1.0 REQUIRED IMPORTED_TARGET)
+
 # This is needed for the precompiled header
 get_target_property(Vulkan_INCLUDE_DIR Vulkan::Headers INTERFACE_INCLUDE_DIRECTORIES)
 
@@ -205,6 +208,11 @@ set(SCOPEHAL_SOURCES
 	SiglentSCPIOscilloscope.cpp
 	SiglentVectorSignalGenerator.cpp
 	SigrokOscilloscope.cpp
+	slogic/slogic.c
+	slogic/slogic8u2.c
+	slogic/slogic16u3.c
+	slogic/slogic32u3.c
+	SLogicOscilloscope.cpp
 	TektronixOscilloscope.cpp
 	TektronixHSIOscilloscope.cpp
 	ThunderScopeOscilloscope.cpp
@@ -272,6 +280,7 @@ target_link_libraries(scopehal
 	Vulkan::Headers
 	glslang::glslang
 	glfw
+	PkgConfig::LIBUSB
 	${WIN_LIBS}
 	)
 

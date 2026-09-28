@@ -747,6 +747,29 @@ public:
 	 */
 	virtual void SetADCMode(size_t channel, size_t mode);
 
+	/**
+		@brief Returns true if the instrument has a configurable capture/pattern mode, false otherwise.
+
+		This is an instrument-global setting (not per channel). It typically selects a built-in test
+		pattern or emulation source in place of live acquisition.
+	 */
+	virtual bool IsPatternModeConfigurable();
+
+	/**
+		@brief Gets the names of the available capture/pattern modes.
+	 */
+	virtual std::vector<std::string> GetPatternModeNames();
+
+	/**
+		@brief Gets the current capture/pattern mode index.
+	 */
+	virtual size_t GetPatternMode();
+
+	/**
+		@brief Sets the current capture/pattern mode index.
+	 */
+	virtual void SetPatternMode(size_t mode);
+
 	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	// Logic analyzer configuration
 

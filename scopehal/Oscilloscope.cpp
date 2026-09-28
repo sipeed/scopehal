@@ -906,6 +906,26 @@ void Oscilloscope::SetADCMode(size_t /*channel*/, size_t /*mode*/)
 	//no-op
 }
 
+bool Oscilloscope::IsPatternModeConfigurable()
+{
+	return false;
+}
+
+vector<string> Oscilloscope::GetPatternModeNames()
+{
+	return vector<string>();
+}
+
+size_t Oscilloscope::GetPatternMode()
+{
+	return 0;
+}
+
+void Oscilloscope::SetPatternMode(size_t /*mode*/)
+{
+	//no-op
+}
+
 bool Oscilloscope::CanInvert(size_t /*i*/)
 {
 	return false;
