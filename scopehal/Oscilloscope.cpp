@@ -961,6 +961,11 @@ void Oscilloscope::SetChannelGroupAnalog(size_t /*group*/, bool /*analog*/)
 	//no-op
 }
 
+vector<size_t> Oscilloscope::GetChannelGroupChannelIndices(size_t /*group*/)
+{
+	return vector<size_t>();
+}
+
 bool Oscilloscope::CanInvert(size_t /*i*/)
 {
 	return false;

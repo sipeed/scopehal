@@ -135,6 +135,7 @@ public:
 	virtual size_t GetChannelGroupCount() override;
 	virtual bool IsChannelGroupAnalog(size_t group) override;
 	virtual void SetChannelGroupAnalog(size_t group, bool analog) override;
+	virtual std::vector<size_t> GetChannelGroupChannelIndices(size_t group) override;
 	virtual std::vector<AnalogBank> GetAnalogBanks() override;
 	virtual AnalogBank GetAnalogBank(size_t channel) override;
 

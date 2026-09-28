@@ -811,6 +811,12 @@ public:
 	 */
 	virtual void SetChannelGroupAnalog(size_t group, bool analog);
 
+	/**
+		@brief Returns the channel indices that make up a channel group (both its analog and digital
+		members), so the UI can act on a group without knowing the driver's channel layout. Empty by default.
+	 */
+	virtual std::vector<size_t> GetChannelGroupChannelIndices(size_t group);
+
 	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	// Logic analyzer configuration
 

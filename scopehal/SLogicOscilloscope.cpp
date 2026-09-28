@@ -1465,6 +1465,19 @@ void SLogicOscilloscope::SetChannelGroupAnalog(size_t group, bool analog)
 	LogDebug("SLogic: SetChannelGroupAnalog(group=%zu, %s)\n", group, analog ? "analog" : "digital");
 }
 
+//Channel indices making up byte-group g: the analog A<g> at g*9, then the 8 digital D<8g+k> at g*9+1..8.
+vector<size_t> SLogicOscilloscope::GetChannelGroupChannelIndices(size_t group)
+{
+	lock_guard<recursive_mutex> lock(m_mutex);
+	vector<size_t> idx;
+	size_t base = group * 9;
+	if(base >= m_channels.size())
+		return idx;
+	for(size_t k=0; k<9 && (base + k) < m_channels.size(); k++)
+		idx.push_back(base + k);
+	return idx;
+}
+
 //Retarget the edge trigger to the first enabled channel if its current input channel is disabled.
 void SLogicOscilloscope::RetargetTriggerIfNeeded()
 {
