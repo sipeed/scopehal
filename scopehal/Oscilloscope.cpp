@@ -926,6 +926,26 @@ void Oscilloscope::SetPatternMode(size_t /*mode*/)
 	//no-op
 }
 
+bool Oscilloscope::IsCaptureWidthConfigurable()
+{
+	return false;
+}
+
+vector<string> Oscilloscope::GetCaptureWidthNames()
+{
+	return vector<string>();
+}
+
+size_t Oscilloscope::GetCaptureWidth()
+{
+	return 0;
+}
+
+void Oscilloscope::SetCaptureWidth(size_t /*mode*/)
+{
+	//no-op
+}
+
 bool Oscilloscope::CanInvert(size_t /*i*/)
 {
 	return false;

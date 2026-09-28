@@ -770,6 +770,29 @@ public:
 	 */
 	virtual void SetPatternMode(size_t mode);
 
+	/**
+		@brief Returns true if the instrument has a selectable channel mode / capture width, false otherwise.
+
+		This is an instrument-global setting. It typically trades the number of active channels against
+		the maximum sample rate (e.g. a logic analyzer that runs 8 channels at 800 MHz or 32 at 200 MHz).
+	 */
+	virtual bool IsCaptureWidthConfigurable();
+
+	/**
+		@brief Gets the names of the available channel modes (e.g. "8 ch — max 800 MHz").
+	 */
+	virtual std::vector<std::string> GetCaptureWidthNames();
+
+	/**
+		@brief Gets the current channel-mode index.
+	 */
+	virtual size_t GetCaptureWidth();
+
+	/**
+		@brief Sets the current channel-mode index.
+	 */
+	virtual void SetCaptureWidth(size_t mode);
+
 	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	// Logic analyzer configuration
 

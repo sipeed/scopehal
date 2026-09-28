@@ -361,48 +361,9 @@ void SLogicOscilloscope::BuildChannels()
 		}
 	}
 
-	//Enable the active subset: groups 0..(m_channelCount/8 - 1); each active group
-	//is analog (its A channel) or digital (its 8 D channels) per m_analogGroups.
-	size_t activeGroups = m_channelCount / 8;
-	for(size_t g = 0; g < ngroups; g++)
-	{
-		size_t base = g * 9;	//A<g> at base; D<8g+k> at base+1+k
-		bool active = (g < activeGroups);
-		bool analog = m_analogGroups.count(g) > 0;
-		if(active && analog)
-			EnableChannel(base);
-		else
-			DisableChannel(base);
-		for(size_t k = 0; k < 8; k++)
-		{
-			if(active && !analog)
-				EnableChannel(base + 1 + k);
-			else
-				DisableChannel(base + 1 + k);
-		}
-	}
-
-	//Build analog + digital banks
-	m_analogBanks.clear();
-	m_digitalBanks.clear();
-	{
-		AnalogBank abank;
-		DigitalBank dbank;
-		for(size_t i = 0; i < m_channels.size(); i++)
-		{
-			auto chan = GetOscilloscopeChannel(i);
-			if(!chan)
-				continue;
-			if(chan->GetType(0) == Stream::STREAM_TYPE_ANALOG)
-				abank.push_back(chan);
-			else if(chan->GetType(0) == Stream::STREAM_TYPE_DIGITAL)
-				dbank.push_back(chan);
-		}
-		if(!abank.empty())
-			m_analogBanks.push_back(abank);
-		if(!dbank.empty())
-			m_digitalBanks.push_back(dbank);
-	}
+	//Enable the active channel subset and build the analog/digital banks.
+	ApplyChannelEnables();
+	RebuildBanks();
 
 	//Configure a rising-edge trigger on the first enabled channel
 	size_t trigIdx = 0;
@@ -919,7 +880,12 @@ void SLogicOscilloscope::ReshapeAndQueue()
 	//can't mutate these mid-read. Recursive mutex: FindTriggerSample below is covered by this.
 	lock_guard<recursive_mutex> lock(m_mutex);
 
-	int unit = m_channelCount / 8;
+	//Use the channel count the buffer was actually captured with (m_captureCfg), not the live
+	//m_channelCount — the user may have changed the channel mode between capture and reshape.
+	int capCount = m_captureCfg.channel_count;
+	if(capCount < 1)
+		capCount = m_channelCount;
+	int unit = capCount / 8;
 	if(unit < 1)
 		unit = 1;
 	size_t activeGroups = (size_t)unit;
@@ -941,14 +907,20 @@ void SLogicOscilloscope::ReshapeAndQueue()
 
 	int64_t fs_per_sample = (m_srate > 0) ? (int64_t)(1e15 / (double)m_srate) : 1;
 
-	//Active layout: byte g of each sample → group g (analog A<g> at g*9, else D<8g+k> at g*9+1..8)
-	struct Grp { size_t byteOffset; bool analog; size_t firstChannel; };
+	//Active layout: byte g of each sample → group g (analog A<g> at g*9, else D<8g+k> at g*9+1..8).
+	//A partial last group emits only its valid low bits (e.g. 4 ch → D0..D3). Analog covers a whole
+	//byte, so a group is analog only when fully inside the capture width.
+	struct Grp { size_t byteOffset; bool analog; size_t firstChannel; size_t nbits; };
 	vector<Grp> layout;
 	for(size_t g=0; g<activeGroups; g++)
 	{
-		bool analog = m_analogGroups.count(g) > 0;
+		bool groupFull = ((g*8 + 8) <= (size_t)capCount);
+		bool analog = (m_analogGroups.count(g) > 0) && groupFull;
 		size_t base = g*9;
-		layout.push_back({ g, analog, analog ? base : base+1 });
+		size_t nbits = (size_t)capCount - g*8;
+		if(nbits > 8)
+			nbits = 8;
+		layout.push_back({ g, analog, analog ? base : base+1, nbits });
 	}
 
 	double t = GetTime();
@@ -978,7 +950,7 @@ void SLogicOscilloscope::ReshapeAndQueue()
 		}
 		else
 		{
-			for(size_t k=0; k<8; k++)
+			for(size_t k=0; k<g.nbits; k++)
 			{
 				auto cap = new SparseDigitalWaveform;
 				s[GetOscilloscopeChannel(g.firstChannel + k)] = cap;
@@ -1006,7 +978,7 @@ void SLogicOscilloscope::ReshapeAndQueue()
 			}
 			else
 			{
-				for(size_t k=0; k<8; k++)
+				for(size_t k=0; k<g.nbits; k++)
 				{
 					size_t idx = g.firstChannel + k;
 					uint8_t bit = (byteval >> k) & 1;
@@ -1038,7 +1010,7 @@ void SLogicOscilloscope::ReshapeAndQueue()
 		}
 		else
 		{
-			for(size_t k=0; k<8; k++)
+			for(size_t k=0; k<g.nbits; k++)
 			{
 				size_t idx = g.firstChannel + k;
 				rle_offsets[idx].push_back(last_start[idx]);
@@ -1353,6 +1325,169 @@ void SLogicOscilloscope::SetPatternMode(size_t mode)
 		LogDebug("SLogic: SetPatternMode(%zu = %s)\n", mode,
 			(mode < (size_t)SLOGIC_PATTERN_COUNT) ? slogic_pattern_names[mode] : "?");
 	}
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Channel mode (capture width)
+
+//The model's channel->max-rate limit table is the set of selectable capture widths: fewer active
+//channels allow a higher sample rate (e.g. 32u3: 32 ch @ 200 MHz .. 4 ch @ 1400 MHz). Presented
+//highest channel count first so full width is the default at the top of the list.
+vector<slogic_rate_limit> SLogicOscilloscope::CaptureWidthOptions()
+{
+	vector<slogic_rate_limit> opts;
+	if(!m_model)
+		return opts;
+	for(size_t i=0; i<m_model->limit_count; i++)
+		opts.push_back(m_model->limits[i]);
+	sort(opts.begin(), opts.end(),
+		[](const slogic_rate_limit& a, const slogic_rate_limit& b) { return a.channels > b.channels; });
+	return opts;
+}
+
+bool SLogicOscilloscope::IsCaptureWidthConfigurable()
+{
+	return m_model && (m_model->limit_count > 1);
+}
+
+vector<string> SLogicOscilloscope::GetCaptureWidthNames()
+{
+	vector<string> names;
+	for(auto& o : CaptureWidthOptions())
+		names.push_back(to_string(o.channels) + " ch \xE2\x80\x94 max " +
+			to_string((unsigned long long)(o.max_rate_hz / 1000000ULL)) + " MHz");
+	return names;
+}
+
+size_t SLogicOscilloscope::GetCaptureWidth()
+{
+	lock_guard<recursive_mutex> lock(m_mutex);
+	auto opts = CaptureWidthOptions();
+	for(size_t i=0; i<opts.size(); i++)
+	{
+		if(opts[i].channels == m_channelCount)
+			return i;
+	}
+	return 0;
+}
+
+void SLogicOscilloscope::SetCaptureWidth(size_t mode)
+{
+	lock_guard<recursive_mutex> lock(m_mutex);
+	auto opts = CaptureWidthOptions();
+	if(mode >= opts.size())
+		return;
+	int newCount = opts[mode].channels;
+	uint64_t maxRate = opts[mode].max_rate_hz;
+	m_channelCount = newCount;
+
+	//Increment 1 is all-digital; per-group analog selection lands in increment 2.
+	m_analogGroups.clear();
+
+	ApplyChannelEnables();
+	RebuildBanks();
+
+	//Clamp the sample rate to the new ceiling, snapping down to the highest advertised rate <= ceiling.
+	if(m_srate > maxRate)
+	{
+		uint64_t best = maxRate;
+		if(m_model)
+		{
+			best = 0;
+			for(size_t i=0; i<m_model->rate_count; i++)
+			{
+				uint64_t r = m_model->rates[i];
+				if((r <= maxRate) && (r > best))
+					best = r;
+			}
+			if(best == 0)
+				best = maxRate;
+		}
+		m_srate = best;
+	}
+
+	//If the trigger's channel is now disabled, retarget it to the first enabled channel.
+	auto edge = dynamic_cast<EdgeTrigger*>(GetTrigger());
+	if(edge)
+	{
+		auto in = edge->GetInput(0);
+		bool inputEnabled = false;
+		for(size_t i=0; i<m_channels.size(); i++)
+		{
+			if((in.m_channel == GetOscilloscopeChannel(i)) && IsChannelEnabled(i))
+			{
+				inputEnabled = true;
+				break;
+			}
+		}
+		if(!inputEnabled)
+		{
+			for(size_t i=0; i<m_channels.size(); i++)
+			{
+				if(IsChannelEnabled(i))
+				{
+					edge->SetInput(0, StreamDescriptor(GetOscilloscopeChannel(i)));
+					edge->SetLevel(0);
+					break;
+				}
+			}
+		}
+	}
+
+	m_lastTrigState = -1;	//trigger source/width changed: re-baseline the cross-buffer scan
+	LogDebug("SLogic: SetCaptureWidth -> %d ch (max %llu MHz)\n",
+		newCount, (unsigned long long)(maxRate / 1000000ULL));
+}
+
+//Enable/disable the physical channel set from m_channelCount + m_analogGroups, handling a partial
+//last byte-group (e.g. 4 ch enables only D0..D3). Analog covers a whole byte, so a group can be
+//analog only when fully within the capture width.
+void SLogicOscilloscope::ApplyChannelEnables()
+{
+	if(!m_model)
+		return;
+	size_t ngroups = (size_t)m_model->physical_channels / 8;
+	for(size_t g=0; g<ngroups; g++)
+	{
+		size_t base = g * 9;	//A<g> at base; D<8g+k> at base+1+k
+		bool analog = m_analogGroups.count(g) > 0;
+		bool groupFull = ((g*8 + 8) <= (size_t)m_channelCount);
+		bool asAnalog = analog && groupFull;
+		if(asAnalog)
+			EnableChannel(base);
+		else
+			DisableChannel(base);
+		for(size_t k=0; k<8; k++)
+		{
+			size_t d = 8*g + k;
+			if((d < (size_t)m_channelCount) && !asAnalog)
+				EnableChannel(base + 1 + k);
+			else
+				DisableChannel(base + 1 + k);
+		}
+	}
+}
+
+void SLogicOscilloscope::RebuildBanks()
+{
+	m_analogBanks.clear();
+	m_digitalBanks.clear();
+	AnalogBank abank;
+	DigitalBank dbank;
+	for(size_t i=0; i<m_channels.size(); i++)
+	{
+		auto chan = GetOscilloscopeChannel(i);
+		if(!chan)
+			continue;
+		if(chan->GetType(0) == Stream::STREAM_TYPE_ANALOG)
+			abank.push_back(chan);
+		else if(chan->GetType(0) == Stream::STREAM_TYPE_DIGITAL)
+			dbank.push_back(chan);
+	}
+	if(!abank.empty())
+		m_analogBanks.push_back(abank);
+	if(!dbank.empty())
+		m_digitalBanks.push_back(dbank);
 }
 
 vector<Oscilloscope::AnalogBank> SLogicOscilloscope::GetAnalogBanks()

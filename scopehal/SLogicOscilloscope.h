@@ -128,6 +128,10 @@ public:
 	virtual std::vector<std::string> GetPatternModeNames() override;
 	virtual size_t GetPatternMode() override;
 	virtual void SetPatternMode(size_t mode) override;
+	virtual bool IsCaptureWidthConfigurable() override;
+	virtual std::vector<std::string> GetCaptureWidthNames() override;
+	virtual size_t GetCaptureWidth() override;
+	virtual void SetCaptureWidth(size_t mode) override;
 	virtual std::vector<AnalogBank> GetAnalogBanks() override;
 	virtual AnalogBank GetAnalogBank(size_t channel) override;
 
@@ -146,6 +150,12 @@ protected:
 
 	///@brief Create the full physical channel set and enable the active subset
 	void BuildChannels();
+	///@brief Enable/disable the physical channel set from m_channelCount + m_analogGroups (handles a partial last byte-group)
+	void ApplyChannelEnables();
+	///@brief Rebuild m_analogBanks / m_digitalBanks from the current channels
+	void RebuildBanks();
+	///@brief Model channel-mode options (channel count + max rate), highest channel count first
+	std::vector<slogic_rate_limit> CaptureWidthOptions();
 	///@brief Analog channel color by index
 	std::string GetChannelColor(size_t i);
 
