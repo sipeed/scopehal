@@ -110,7 +110,7 @@ int SLogicOscilloscope::CtrlWrite(void* ctx, uint8_t bRequest, uint16_t wValue,
 		return LIBUSB_ERROR_NO_DEVICE;
 	lock_guard<mutex> lk(self->m_transportMutex);
 	return libusb_control_transfer(self->m_devh,
-		LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_OUT, bRequest,
+		(uint8_t)((uint8_t)LIBUSB_REQUEST_TYPE_VENDOR | (uint8_t)LIBUSB_ENDPOINT_OUT), bRequest,
 		wValue, wIndex, const_cast<uint8_t*>(data), len, (int)timeoutMs);
 }
 
@@ -122,7 +122,7 @@ int SLogicOscilloscope::CtrlRead(void* ctx, uint8_t bRequest, uint16_t wValue,
 		return LIBUSB_ERROR_NO_DEVICE;
 	lock_guard<mutex> lk(self->m_transportMutex);
 	return libusb_control_transfer(self->m_devh,
-		LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_IN, bRequest,
+		(uint8_t)((uint8_t)LIBUSB_REQUEST_TYPE_VENDOR | (uint8_t)LIBUSB_ENDPOINT_IN), bRequest,
 		wValue, wIndex, data, len, (int)timeoutMs);
 }
 
