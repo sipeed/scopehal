@@ -145,6 +145,9 @@ public:
 	virtual std::vector<DigitalBank> GetDigitalBanks() override;
 
 	//Digital threshold / hysteresis
+	//The device has a single global comparator threshold (one DAC feeding every digital input),
+	//so the threshold is instrument-wide: Set/Get ignore the channel argument and share one value.
+	virtual bool IsDigitalThresholdConfigurable() override;
 	virtual float GetDigitalHysteresis(size_t channel) override;
 	virtual float GetDigitalThreshold(size_t channel) override;
 	virtual void SetDigitalHysteresis(size_t channel, float level) override;
@@ -175,7 +178,8 @@ protected:
 	std::map<size_t, unsigned int> m_channelBandwidth;
 	std::map<size_t, float> m_channelVoltageRange;
 	std::map<size_t, float> m_channelOffset;
-	std::map<size_t, float> m_digitalThresholds;
+	///@brief Global digital comparator threshold in volts (the device has a single Vth for all D channels)
+	float m_digitalThreshold = 1.6f;
 	std::map<size_t, float> m_digitalHysteresis;
 
 	///@brief Current sample rate (Hz)

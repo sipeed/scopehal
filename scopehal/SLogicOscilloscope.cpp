@@ -363,7 +363,6 @@ void SLogicOscilloscope::BuildChannels()
 				idx);
 			m_channels.push_back(chan);
 			m_channelAttenuation[idx] = 1;
-			m_digitalThresholds[idx] = 1.6;
 			m_digitalHysteresis[idx] = 0.1;
 		}
 	}
@@ -577,8 +576,7 @@ bool SLogicOscilloscope::AcquireData()
 		mdepth = m_mdepth;
 		chanCount = m_channelCount;
 		pattern = m_patternMode;
-		if(!m_digitalThresholds.empty())
-			vth = m_digitalThresholds.begin()->second;
+		vth = m_digitalThreshold;	//single global comparator threshold for all digital inputs
 	}
 
 	int unit = chanCount / 8;
@@ -596,7 +594,7 @@ bool SLogicOscilloscope::AcquireData()
 	m_restartPending = false;
 	m_inFlight = 0;
 
-	//Build capture config from the snapshot (threshold: first digital channel's, else 1.6 V)
+	//Build capture config from the snapshot (threshold: the global digital comparator Vth)
 	m_captureCfg.channel_count = chanCount;
 	m_captureCfg.samplerate_hz = srate;
 	m_captureCfg.threshold_v = vth;
@@ -1276,18 +1274,27 @@ bool SLogicOscilloscope::SetInterleaving(bool /*combine*/)
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Digital threshold / hysteresis
 
-float SLogicOscilloscope::GetDigitalThreshold(size_t channel)
+bool SLogicOscilloscope::IsDigitalThresholdConfigurable()
 {
-	lock_guard<recursive_mutex> lock(m_mutex);
-	auto it = m_digitalThresholds.find(channel);
-	return (it != m_digitalThresholds.end()) ? it->second : 1.6;
+	//The device exposes a single programmable comparator threshold for all digital inputs.
+	return true;
 }
 
-void SLogicOscilloscope::SetDigitalThreshold(size_t channel, float level)
+float SLogicOscilloscope::GetDigitalThreshold(size_t /*channel*/)
 {
+	//Global threshold: the device has one comparator Vth shared by every digital input.
 	lock_guard<recursive_mutex> lock(m_mutex);
-	m_digitalThresholds[channel] = level;
-	LogDebug("SLogic: SetDigitalThreshold(ch=%zu, %.3f V)\n", channel, level);
+	return m_digitalThreshold;
+}
+
+void SLogicOscilloscope::SetDigitalThreshold(size_t /*channel*/, float level)
+{
+	//Global threshold: editing any digital channel retargets the one device-wide Vth, so every
+	//channel reads back the same value and there is no per-channel threshold to drift out of sync.
+	lock_guard<recursive_mutex> lock(m_mutex);
+	m_digitalThreshold = level;
+	m_lastTrigState = -1;	//threshold changes the captured bits; re-baseline the cross-buffer scan
+	LogDebug("SLogic: SetDigitalThreshold(%.3f V, global)\n", level);
 }
 
 float SLogicOscilloscope::GetDigitalHysteresis(size_t channel)
