@@ -609,6 +609,7 @@ bool SLogicOscilloscope::AcquireData()
 		return false;
 	}
 	slogic_stream_init(&m_stream, &m_plan, m_captureNeed);
+	m_stream.drop_left = m_model->first_drop_bytes;	//per-model HW quirk (16U3 only; 0 for 32U3/Combo8)
 	m_lastXferUs = MonotonicUs();
 
 	//Device (re)start sequence (control path on the session thread only — never from the bulk
