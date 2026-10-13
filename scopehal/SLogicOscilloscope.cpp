@@ -937,111 +937,202 @@ void SLogicOscilloscope::ReshapeAndQueue()
 	double t = GetTime();
 	int64_t fs = (int64_t)((t - floor(t)) * FS_PER_SECOND);
 
+	//Reshape sample-major bytes into per-channel waveforms. This is the heaviest step
+	//of a capture, so the digital groups are converted on worker threads, and each
+	//digital bit gets whichever representation is cheaper:
+	//
+	//  * Sparse (RLE) when transitions are rare — the normal case for real signals.
+	//  * Dense (uniform, one byte per sample) when a bit toggles often. The Emulation
+	//    counter's low bits flip almost every sample, so RLE is *larger* than dense
+	//    there; at deep depths the old sparse-only, single-threaded path grew the run
+	//    vectors to tens of GB of push_back()s and froze ngscopeclient. Dense is
+	//    bounded and reallocation-free.
+	//
+	//To keep AcceleratorBuffer allocation off the worker threads, the work is phased:
+	//count (parallel) -> allocate exact-size buffers (serial) -> fill (parallel).
 	SequenceSet s;
 	size_t totalCh = m_channels.size();
-	vector< vector<int64_t> > rle_offsets(totalCh);
-	vector< vector<int64_t> > rle_durations(totalCh);
-	vector< vector<uint8_t> > rle_samples(totalCh);
-	vector<uint8_t> last_val(totalCh, 0);
-	vector<int64_t> last_start(totalCh, 0);
 
-	//Create waveforms up front
+	if(numSamples > 100ull*1000*1000)
+		LogWarning("SLogic: reshaping a deep capture (%llu samples x %d ch) may use several GB of RAM\n",
+			(unsigned long long)numSamples, capCount);
+
+	//Analog groups are always dense and cheap; fill them inline.
 	for(auto& g : layout)
 	{
-		if(g.analog)
+		if(!g.analog)
+			continue;
+		auto cap = new UniformAnalogWaveform;
+		cap->m_timescale = fs_per_sample;
+		cap->m_triggerPhase = 0;
+		cap->m_startTimestamp = time(NULL);
+		cap->m_startFemtoseconds = fs;
+		cap->PrepareForCpuAccess();
+		cap->Resize(numSamples);
+		for(uint64_t i=0; i<numSamples; i++)
 		{
-			auto cap = new UniformAnalogWaveform;
-			s[GetOscilloscopeChannel(g.firstChannel)] = cap;
-			cap->m_timescale = fs_per_sample;
-			cap->m_triggerPhase = 0;
-			cap->m_startTimestamp = time(NULL);
-			cap->m_startFemtoseconds = fs;
-			cap->PrepareForCpuAccess();
-			cap->Resize(numSamples);
+			uint8_t byteval = m_captureBuf[(size_t)(startSample + i) * unit + g.byteOffset];
+			//Fixed physical mapping (0..255 -> -15..+15 V) scaled by the probe attenuation, and
+			//independent of the display range so vertical zoom rescales the view, not the data.
+			cap->m_samples[i] = (-g_slogicAnalogVfs + (byteval / 255.0f) * g_slogicAnalogSpan) * g.atten;
 		}
-		else
+		cap->MarkSamplesModifiedFromCpu();
+		s[GetOscilloscopeChannel(g.firstChannel)] = cap;
+	}
+
+	//Digital groups: one worker per byte-group.
+	vector<Grp> dgroups;
+	for(auto& g : layout)
+		if(!g.analog)
+			dgroups.push_back(g);
+
+	const uint8_t* buf = m_captureBuf.data();
+	const size_t stride = (size_t)unit;
+	const size_t base0 = (size_t)startSample * stride;
+
+	//Per-channel conversion state, indexed by oscilloscope channel index.
+	vector<uint64_t> runs(totalCh, 0);
+	vector<SparseDigitalWaveform*> sparse(totalCh, nullptr);
+	vector<UniformDigitalWaveform*> dense(totalCh, nullptr);
+	vector<int64_t*> soff(totalCh, nullptr);
+	vector<int64_t*> sdur(totalCh, nullptr);
+
+	//Phase 1 (parallel): count transitions -> sparse run count, one scan per byte column.
+	auto countGroup = [&](const Grp& g)
+	{
+		uint8_t prev[8];
+		uint64_t r[8];
+		for(size_t k=0; k<g.nbits; k++)
 		{
+			prev[k] = (buf[base0 + g.byteOffset] >> k) & 1;
+			r[k] = 1;
+		}
+		for(uint64_t i=1; i<numSamples; i++)
+		{
+			uint8_t byteval = buf[base0 + i*stride + g.byteOffset];
 			for(size_t k=0; k<g.nbits; k++)
 			{
+				uint8_t bit = (byteval >> k) & 1;
+				if(bit != prev[k])
+				{
+					r[k]++;
+					prev[k] = bit;
+				}
+			}
+		}
+		for(size_t k=0; k<g.nbits; k++)
+			runs[g.firstChannel + k] = r[k];
+	};
+	{
+		vector<thread> workers;
+		for(size_t gi=0; gi<dgroups.size(); gi++)
+			workers.emplace_back([&,gi]{ countGroup(dgroups[gi]); });
+		for(auto& w : workers)
+			w.join();
+	}
+
+	//Phase 2 (serial): allocate each bit with the cheaper representation at exact size.
+	//A sparse run costs 17 bytes (two int64 offset+duration, one bool); dense costs 1 byte/sample.
+	for(auto& g : dgroups)
+	{
+		for(size_t k=0; k<g.nbits; k++)
+		{
+			size_t idx = g.firstChannel + k;
+			if(runs[idx] * 17 < numSamples)
+			{
 				auto cap = new SparseDigitalWaveform;
-				s[GetOscilloscopeChannel(g.firstChannel + k)] = cap;
 				cap->m_timescale = fs_per_sample;
 				cap->m_triggerPhase = 0;
 				cap->m_startTimestamp = time(NULL);
 				cap->m_startFemtoseconds = fs;
-			}
-		}
-	}
-
-	//Fill
-	for(uint64_t i=0; i<numSamples; i++)
-	{
-		size_t base = (size_t)(startSample + i) * unit;
-		for(auto& g : layout)
-		{
-			uint8_t byteval = m_captureBuf[base + g.byteOffset];
-			if(g.analog)
-			{
-				size_t idx = g.firstChannel;
-				auto cap = static_cast<UniformAnalogWaveform*>(s[GetOscilloscopeChannel(idx)]);
-				//Fixed physical mapping (0..255 -> -15..+15 V) scaled by the probe attenuation, and
-				//independent of the display range so vertical zoom rescales the view, not the data.
-				cap->m_samples[i] = (-g_slogicAnalogVfs + (byteval / 255.0f) * g_slogicAnalogSpan) * g.atten;
+				cap->PrepareForCpuAccess();
+				cap->Resize(runs[idx]);
+				sparse[idx] = cap;
+				soff[idx] = cap->m_offsets.GetCpuPointer();
+				sdur[idx] = cap->m_durations.GetCpuPointer();
 			}
 			else
 			{
-				for(size_t k=0; k<g.nbits; k++)
-				{
-					size_t idx = g.firstChannel + k;
-					uint8_t bit = (byteval >> k) & 1;
-					if(i == 0)
-					{
-						last_val[idx] = bit;
-						last_start[idx] = 0;
-					}
-					else if(bit != last_val[idx])
-					{
-						rle_offsets[idx].push_back(last_start[idx]);
-						rle_durations[idx].push_back((int64_t)i - last_start[idx]);
-						rle_samples[idx].push_back(last_val[idx]);
-						last_val[idx] = bit;
-						last_start[idx] = (int64_t)i;
-					}
-				}
+				auto cap = new UniformDigitalWaveform;
+				cap->m_timescale = fs_per_sample;
+				cap->m_triggerPhase = 0;
+				cap->m_startTimestamp = time(NULL);
+				cap->m_startFemtoseconds = fs;
+				cap->PrepareForCpuAccess();
+				cap->Resize(numSamples);
+				dense[idx] = cap;
 			}
 		}
 	}
 
-	//Finish: flush analog + last RLE run per digital channel
-	for(auto& g : layout)
+	//Phase 3 (parallel): fill the pre-allocated buffers, one scan per byte column.
+	auto fillGroup = [&](const Grp& g)
 	{
-		if(g.analog)
+		uint8_t sprev[8];
+		int64_t sstart[8];
+		uint64_t sr[8];
+		for(size_t k=0; k<g.nbits; k++)
 		{
-			auto cap = static_cast<UniformAnalogWaveform*>(s[GetOscilloscopeChannel(g.firstChannel)]);
-			cap->MarkSamplesModifiedFromCpu();
+			size_t idx = g.firstChannel + k;
+			uint8_t bit = (buf[base0 + g.byteOffset] >> k) & 1;
+			sprev[k] = bit;
+			sstart[k] = 0;
+			sr[k] = 0;
+			if(dense[idx])
+				dense[idx]->m_samples[0] = bit ? true : false;
 		}
-		else
+		for(uint64_t i=1; i<numSamples; i++)
 		{
+			uint8_t byteval = buf[base0 + i*stride + g.byteOffset];
 			for(size_t k=0; k<g.nbits; k++)
 			{
 				size_t idx = g.firstChannel + k;
-				rle_offsets[idx].push_back(last_start[idx]);
-				rle_durations[idx].push_back((int64_t)numSamples - last_start[idx]);
-				rle_samples[idx].push_back(last_val[idx]);
-
-				auto cap = static_cast<SparseDigitalWaveform*>(s[GetOscilloscopeChannel(idx)]);
-				size_t memdepth = rle_offsets[idx].size();
-				cap->PrepareForCpuAccess();
-				cap->Resize(memdepth);
-				memcpy(cap->m_offsets.GetCpuPointer(), rle_offsets[idx].data(), memdepth*sizeof(int64_t));
-				memcpy(cap->m_durations.GetCpuPointer(), rle_durations[idx].data(), memdepth*sizeof(int64_t));
-				for(size_t j=0; j<memdepth; j++)
-					cap->m_samples[j] = rle_samples[idx][j] ? true : false;
-				cap->MarkSamplesModifiedFromCpu();
-				cap->MarkTimestampsModifiedFromCpu();
+				uint8_t bit = (byteval >> k) & 1;
+				if(dense[idx])
+					dense[idx]->m_samples[i] = bit ? true : false;
+				else if(bit != sprev[k])
+				{
+					soff[idx][sr[k]] = sstart[k];
+					sdur[idx][sr[k]] = (int64_t)i - sstart[k];
+					sparse[idx]->m_samples[sr[k]] = sprev[k] ? true : false;
+					sr[k]++;
+					sprev[k] = bit;
+					sstart[k] = (int64_t)i;
+				}
 			}
 		}
+		//Flush the final run and mark buffers modified.
+		for(size_t k=0; k<g.nbits; k++)
+		{
+			size_t idx = g.firstChannel + k;
+			if(dense[idx])
+				dense[idx]->MarkSamplesModifiedFromCpu();
+			else
+			{
+				soff[idx][sr[k]] = sstart[k];
+				sdur[idx][sr[k]] = (int64_t)numSamples - sstart[k];
+				sparse[idx]->m_samples[sr[k]] = sprev[k] ? true : false;
+				sparse[idx]->MarkSamplesModifiedFromCpu();
+				sparse[idx]->MarkTimestampsModifiedFromCpu();
+			}
+		}
+	};
+	{
+		vector<thread> workers;
+		for(size_t gi=0; gi<dgroups.size(); gi++)
+			workers.emplace_back([&,gi]{ fillGroup(dgroups[gi]); });
+		for(auto& w : workers)
+			w.join();
 	}
+
+	//Publish digital waveforms into the SequenceSet (serial; std::map is not thread-safe).
+	for(auto& g : dgroups)
+		for(size_t k=0; k<g.nbits; k++)
+		{
+			size_t idx = g.firstChannel + k;
+			s[GetOscilloscopeChannel(idx)] =
+				dense[idx] ? (WaveformBase*)dense[idx] : (WaveformBase*)sparse[idx];
+		}
 
 	//Queue the waveform set (keep at most 2 pending, like SigrokOscilloscope)
 	m_pendingWaveformsMutex.lock();
