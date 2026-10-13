@@ -212,6 +212,8 @@ set(SCOPEHAL_SOURCES
 	slogic/slogic8u2.c
 	slogic/slogic16u3.c
 	slogic/slogic32u3.c
+	slogic/slogic_data.c
+	slogic/slogic_usb.c
 	SLogicOscilloscope.cpp
 	TektronixOscilloscope.cpp
 	TektronixHSIOscilloscope.cpp
@@ -270,7 +272,11 @@ add_library(scopehal SHARED
 # https://sdk.lunarg.com/sdk/download/1.3.224.1/windows/VulkanSDK-1.3.224.1-Installer.exe
 # https://github.com/KhronosGroup/glslang.git (tags/sdk-1.3.224.1) static lib (SPIRV* glslang OGLCompiler GenericCodeGen MachineIndependent OSDependent)
 
+# libslogic's capture engine (slogic/slogic_usb.c) uses POSIX threads
+find_package(Threads REQUIRED)
+
 target_link_libraries(scopehal
+	Threads::Threads
 	xptools
 	log
 	PkgConfig::SIGCXX

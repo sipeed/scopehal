@@ -86,8 +86,6 @@ SLogicOscilloscope::SLogicOscilloscope(SCPITransport* transport)
 	SCPIDevice::m_model = "SLogic";
 	m_serial = "";
 
-	BindTransport();
-
 	//Open the first attached SLogic device (a specific one can be selected by
 	//serial later via the connection string).
 	if(!OpenDevice())
@@ -100,37 +98,18 @@ SLogicOscilloscope::~SLogicOscilloscope()
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// USB layer (transport shim + device open/claim + libusb event thread)
+// USB layer: the shared libslogic core owns the device (claim, event thread, ring)
 
-int SLogicOscilloscope::CtrlWrite(void* ctx, uint8_t bRequest, uint16_t wValue,
-	uint16_t wIndex, const uint8_t* data, uint16_t len, unsigned timeoutMs)
+void SLogicOscilloscope::OnLog(void* /*user*/, int level, const char* msg)
 {
-	auto* self = reinterpret_cast<SLogicOscilloscope*>(ctx);
-	if(!self || !self->m_devh)
-		return LIBUSB_ERROR_NO_DEVICE;
-	lock_guard<mutex> lk(self->m_transportMutex);
-	return libusb_control_transfer(self->m_devh,
-		(uint8_t)((uint8_t)LIBUSB_REQUEST_TYPE_VENDOR | (uint8_t)LIBUSB_ENDPOINT_OUT), bRequest,
-		wValue, wIndex, const_cast<uint8_t*>(data), len, (int)timeoutMs);
-}
-
-int SLogicOscilloscope::CtrlRead(void* ctx, uint8_t bRequest, uint16_t wValue,
-	uint16_t wIndex, uint8_t* data, uint16_t len, unsigned timeoutMs)
-{
-	auto* self = reinterpret_cast<SLogicOscilloscope*>(ctx);
-	if(!self || !self->m_devh)
-		return LIBUSB_ERROR_NO_DEVICE;
-	lock_guard<mutex> lk(self->m_transportMutex);
-	return libusb_control_transfer(self->m_devh,
-		(uint8_t)((uint8_t)LIBUSB_REQUEST_TYPE_VENDOR | (uint8_t)LIBUSB_ENDPOINT_IN), bRequest,
-		wValue, wIndex, data, len, (int)timeoutMs);
-}
-
-void SLogicOscilloscope::BindTransport()
-{
-	m_transport.ctx = this;
-	m_transport.control_write = &SLogicOscilloscope::CtrlWrite;
-	m_transport.control_read = &SLogicOscilloscope::CtrlRead;
+	switch(level)
+	{
+		case SLOGIC_LOG_ERR:	LogError("SLogic: %s\n", msg); break;
+		case SLOGIC_LOG_WARN:	LogWarning("SLogic: %s\n", msg); break;
+		case SLOGIC_LOG_INFO:	LogNotice("SLogic: %s\n", msg); break;
+		case SLOGIC_LOG_DBG:	LogDebug("SLogic: %s\n", msg); break;
+		default:				break;
+	}
 }
 
 bool SLogicOscilloscope::OpenDevice(const string& serial)
@@ -142,74 +121,30 @@ bool SLogicOscilloscope::OpenDevice(const string& serial)
 		return false;
 	}
 
-	libusb_device** list = nullptr;
-	ssize_t n = libusb_get_device_list(m_usbctx, &list);
-	for(ssize_t i=0; i<n; i++)
+	libusb_device* dev = nullptr;
+	if(slogic_find(m_usbctx, 0, nullptr, serial.empty() ? nullptr : serial.c_str(), &dev) != SLOGIC_OK ||
+		slogic_dev_open(m_usbctx, dev, &SLogicOscilloscope::OnLog, this, &m_sdev) != SLOGIC_OK)
 	{
-		libusb_device* dev = list[i];
-		struct libusb_device_descriptor des;
-		if(libusb_get_device_descriptor(dev, &des) != LIBUSB_SUCCESS)
-			continue;
-		if(des.idVendor != SLOGIC_VID)
-			continue;
-		const slogic_model* model = slogic_model_for_pid(des.idProduct);
-		if(!model)
-			continue;
-
-		libusb_device_handle* h = nullptr;
-		if(libusb_open(dev, &h) != LIBUSB_SUCCESS)
-			continue;
-
-		//Read serial + product strings
-		char sbuf[128] = {0};
-		if(des.iSerialNumber)
-			libusb_get_string_descriptor_ascii(h, des.iSerialNumber, (unsigned char*)sbuf, sizeof(sbuf));
-		string devSerial = sbuf;
-
-		//If a specific serial was requested, skip non-matching devices
-		if(!serial.empty() && devSerial != serial)
-		{
-			libusb_close(h);
-			continue;
-		}
-
-		m_devh = h;
-		m_model = model;
-		m_channelCount = model->physical_channels;
-		SCPIDevice::m_model = model->name;
-		m_serial = devSerial;
-		break;
-	}
-	if(list)
-		libusb_free_device_list(list, 1);
-
-	if(!m_devh)
-	{
+		if(dev)
+			libusb_unref_device(dev);
 		libusb_exit(m_usbctx);
 		m_usbctx = nullptr;
+		m_sdev = nullptr;
 		return false;
 	}
 
-	//Detach any kernel driver, then claim interface 0
-	libusb_set_auto_detach_kernel_driver(m_devh, 1);
-	int cr = libusb_claim_interface(m_devh, 0);
-	if(cr != LIBUSB_SUCCESS)
-	{
-		LogError("SLogicOscilloscope: claim interface 0 failed: %s\n", libusb_error_name(cr));
-		libusb_close(m_devh);
-		m_devh = nullptr;
-		libusb_exit(m_usbctx);
-		m_usbctx = nullptr;
-		return false;
-	}
+	//Serial string, read through the core's open handle
+	struct libusb_device_descriptor des;
+	char sbuf[128] = {0};
+	if(libusb_get_device_descriptor(dev, &des) == LIBUSB_SUCCESS && des.iSerialNumber)
+		libusb_get_string_descriptor_ascii(slogic_dev_handle(m_sdev), des.iSerialNumber,
+			(unsigned char*)sbuf, sizeof(sbuf));
+	libusb_unref_device(dev);
 
-	//Start the libusb event-handling thread before any async work
-	m_eventThreadRun = true;
-	m_eventThread = thread(&SLogicOscilloscope::EventThreadFunc, this);
-
-	//Reset the device to a known state (model-aware; safe for all models)
-	if(slogic_reset(m_model, &m_transport) != SLOGIC_OK)
-		LogWarning("SLogicOscilloscope: slogic_reset failed\n");
+	m_model = slogic_dev_model(m_sdev);
+	m_channelCount = m_model->physical_channels;
+	SCPIDevice::m_model = m_model->name;
+	m_serial = sbuf;
 
 	//Pick sensible defaults, snapped to the nearest advertised value so
 	//GetSampleRate()/GetSampleDepth() always match the advertised lists (a value
@@ -242,54 +177,18 @@ bool SLogicOscilloscope::OpenDevice(const string& serial)
 	return true;
 }
 
-void SLogicOscilloscope::EventThreadFunc()
-{
-	while(m_eventThreadRun)
-	{
-		struct timeval tv;
-		tv.tv_sec = 0;
-		tv.tv_usec = 100000;	//100 ms
-		libusb_handle_events_timeout_completed(m_usbctx, &tv, nullptr);
-	}
-}
-
 void SLogicOscilloscope::CloseDevice()
 {
-	m_eventThreadRun = false;
-	if(m_eventThread.joinable())
-		m_eventThread.join();
-
-	if(m_devh)
+	if(m_sdev)
 	{
-		libusb_release_interface(m_devh, 0);
-		libusb_close(m_devh);
-		m_devh = nullptr;
+		slogic_dev_close(m_sdev);	//destroys a live capture first
+		m_sdev = nullptr;
 	}
 	if(m_usbctx)
 	{
 		libusb_exit(m_usbctx);
 		m_usbctx = nullptr;
 	}
-}
-
-void SLogicOscilloscope::DrainEndpoint()
-{
-	if(!m_devh || !m_model)
-		return;
-
-	//Synchronously read + discard whatever is sitting in the bulk IN endpoint until
-	//it runs dry (short reads that time out with 0 bytes) or a loop cap is hit.
-	//Called between captures when no async ring transfer is in flight.
-	vector<uint8_t> tmp(64 * 1024);
-	int loops = 0;
-	int xfer = 0;
-	int r;
-	do
-	{
-		xfer = 0;
-		r = libusb_bulk_transfer(m_devh, m_model->ep_in, tmp.data(), (int)tmp.size(), &xfer, 50);
-		loops++;
-	} while((r == 0) && (xfer > 0) && (loops < 32));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -488,7 +387,7 @@ void SLogicOscilloscope::PullTrigger()
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Acquisition (in-process finite capture via a libusb async bulk ring + the slogic core)
+// Acquisition (one finite capture through the libslogic capture engine)
 
 int64_t SLogicOscilloscope::MonotonicUs()
 {
@@ -496,71 +395,16 @@ int64_t SLogicOscilloscope::MonotonicUs()
 		chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-void LIBUSB_CALL SLogicOscilloscope::BulkCallback(struct libusb_transfer* xfer)
+int SLogicOscilloscope::OnSamples(void* user, const uint8_t* samples, size_t n, unsigned unitsize)
 {
-	auto* self = reinterpret_cast<SLogicOscilloscope*>(xfer->user_data);
-	if(self)
-		self->OnTransfer(xfer);
-}
-
-void SLogicOscilloscope::OnTransfer(struct libusb_transfer* xfer)
-{
-	int64_t now = MonotonicUs();
-	int64_t dur = now - m_lastXferUs;
-	m_lastXferUs = now;
-
-	bool leaveFlight = true;
-
-	if( (xfer->status == LIBUSB_TRANSFER_COMPLETED) ||
-		(xfer->status == LIBUSB_TRANSFER_TIMED_OUT) )
-	{
-		size_t rawLen = (size_t)xfer->actual_length;
-
-		//Drop the leading 4 bytes of the stream (hardware quirk) across transfers.
-		//slogic_apply_first_drop shifts the buffer and returns the kept length.
-		size_t kept = slogic_apply_first_drop(&m_stream, xfer->buffer, rawLen);
-
-		{
-			lock_guard<mutex> lk(m_captureMutex);
-			if(kept && (m_captureBuf.size() < m_captureNeed))
-			{
-				size_t room = m_captureNeed - m_captureBuf.size();
-				size_t take = min(room, kept);
-				m_captureBuf.insert(m_captureBuf.end(), xfer->buffer, xfer->buffer + take);
-			}
-			if(m_captureBuf.size() >= m_captureNeed)
-				m_captureDone = true;
-		}
-
-		//Fold the RAW received length into the stall watchdog (all-logic canonical policy)
-		slogic_verdict v = slogic_stream_watch(&m_stream, rawLen, now, dur);
-		if(v == SLOGIC_STREAM_ABORT)
-			m_captureAbort = true;
-		else if(v == SLOGIC_STREAM_RETRY_RUN)
-			m_restartPending = true;
-
-		//Resubmit unless finished / aborting / re-arming / stopped
-		if(!m_captureDone && !m_captureAbort && !m_restartPending && m_triggerArmed)
-		{
-			xfer->actual_length = 0;
-			if(libusb_submit_transfer(xfer) == 0)
-				leaveFlight = false;
-		}
-	}
-	else if(xfer->status == LIBUSB_TRANSFER_CANCELLED)
-	{
-		//Expected while the ring drains for a stop or re-arm.
-	}
-	else
-		m_captureAbort = true;
-
-	if(leaveFlight)
-		m_inFlight--;
+	auto* self = reinterpret_cast<SLogicOscilloscope*>(user);
+	self->m_captureBuf.insert(self->m_captureBuf.end(), samples, samples + n * unitsize);
+	return 0;
 }
 
 bool SLogicOscilloscope::AcquireData()
 {
-	if(!m_devh || !m_model)
+	if(!m_sdev || !m_model)
 		return false;
 
 	//Snapshot the user-facing config under m_mutex before using it. The UI thread mutates
@@ -579,97 +423,34 @@ bool SLogicOscilloscope::AcquireData()
 		vth = m_digitalThreshold;	//single global comparator threshold for all digital inputs
 	}
 
-	int unit = chanCount / 8;
-	if(unit < 1)
-		unit = 1;
-
-	m_captureNeed = mdepth * (uint64_t)unit;
-	{
-		lock_guard<mutex> lk(m_captureMutex);
-		m_captureBuf.clear();
-		m_captureBuf.reserve(m_captureNeed);
-	}
-	m_captureDone = false;
+	unsigned unit = slogic_unitsize(chanCount);
+	m_captureBuf.clear();
+	m_captureBuf.reserve(mdepth * unit);
 	m_captureAbort = false;
-	m_restartPending = false;
-	m_inFlight = 0;
 
-	//Build capture config from the snapshot (threshold: the global digital comparator Vth)
-	m_captureCfg.channel_count = chanCount;
-	m_captureCfg.samplerate_hz = srate;
-	m_captureCfg.threshold_v = vth;
-	m_captureCfg.pattern_mode = pattern;
+	slogic_capture_config cfg;
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.dev.channel_count = chanCount;
+	cfg.dev.samplerate_hz = srate;
+	cfg.dev.threshold_v = vth;
+	cfg.dev.pattern_mode = pattern;
+	cfg.limit_samples = mdepth;
+	cfg.sink.user = this;
+	cfg.sink.data = &SLogicOscilloscope::OnSamples;
+	m_captureCfg = cfg.dev;
 
 	LogDebug("SLogic: AcquireData begin (ch=%d, rate=%llu Hz, depth=%llu, pattern=%d)\n",
 		chanCount, (unsigned long long)srate, (unsigned long long)mdepth, pattern);
 
-	if(slogic_plan_transfers(&m_captureCfg, SLOGIC_SIZING_ALLLOGIC, &m_plan) != SLOGIC_OK)
+	slogic_capture* cap = nullptr;
+	int r = slogic_capture_start(m_sdev, &cfg, &cap);
+	if(r != SLOGIC_OK)
 	{
-		LogWarning("SLogic: slogic_plan_transfers failed\n");
+		LogWarning("SLogic: capture start failed (%d)\n", r);
 		return false;
 	}
-	slogic_stream_init(&m_stream, &m_plan, m_captureNeed);
-	m_stream.drop_left = m_model->first_drop_bytes;	//per-model HW quirk (16U3 only; 0 for 32U3/Combo8)
-	m_lastXferUs = MonotonicUs();
 
-	//Device (re)start sequence (control path on the session thread only — never from the bulk
-	//callback: U3 returns BUSY). Order: reset -> clear the bulk IN endpoint's halt/data-toggle
-	//-> configure -> arm the ring -> run.
-	//
-	//The clear_halt is the crucial recovery step. When a capture is aborted mid-stream (e.g. a
-	//trigger re-arm), the device's endpoint data toggle resets on the next CTRL_RST but the
-	//HOST's toggle does not — a vendor reset cannot touch it. The two then mismatch and the bulk
-	//IN endpoint returns 0 bytes on every URB forever, even though reset/configure/run all report
-	//success (exactly the "control OK but got=0/N, stream stalled" failure). libusb_clear_halt
-	//resets the host-side toggle so it resyncs with the freshly-reset device.
-	bool startOk = true;
-	if(slogic_reset(m_model, &m_transport) != SLOGIC_OK)
-	{
-		LogWarning("SLogic: slogic_reset failed\n");
-		startOk = false;
-	}
-	if(startOk)
-	{
-		int che = libusb_clear_halt(m_devh, m_model->ep_in);
-		if(che != 0)
-			LogDebug("SLogic: libusb_clear_halt(ep 0x%02x) = %d (%s)\n",
-				m_model->ep_in, che, libusb_error_name(che));
-	}
-	if(startOk && (slogic_configure(m_model, &m_transport, &m_captureCfg) != SLOGIC_OK))
-	{
-		LogWarning("SLogic: slogic_configure failed\n");
-		startOk = false;
-	}
-
-	//Arm the bulk ring (URBs wait for data), then RUN — URBs are live before the stream starts.
-	int ring = m_plan.ring_count;
-	if(ring < 1) ring = 1;
-	if(ring > SLOGIC_MAX_TRANSFERS) ring = SLOGIC_MAX_TRANSFERS;
-	m_ringBufs.assign(ring, vector<uint8_t>(m_plan.size_bytes));
-	m_ring.clear();
-	if(startOk)
-	{
-		for(int i=0; i<ring; i++)
-		{
-			auto* x = libusb_alloc_transfer(0);
-			libusb_fill_bulk_transfer(x, m_devh, m_model->ep_in,
-				m_ringBufs[i].data(), (int)m_plan.size_bytes,
-				&SLogicOscilloscope::BulkCallback, this, m_plan.timeout_ms);
-			m_ring.push_back(x);
-			if(libusb_submit_transfer(x) == 0)
-				m_inFlight++;
-		}
-	}
-
-	if(startOk && (slogic_run(m_model, &m_transport, &m_captureCfg) != SLOGIC_OK))
-	{
-		LogWarning("SLogic: slogic_run failed\n");
-		startOk = false;
-	}
-	if(!startOk)
-		m_captureAbort = true;
-
-	//Wait for the ring (driven by the event thread) to fill, honoring Stop() and a guard timeout
+	//Poll on this (acquisition) thread until the capture ends, honoring Stop() and a guard
 	int64_t startUs = MonotonicUs();
 	int64_t guardUs = 5000000;	//5 s floor
 	if(srate > 0)
@@ -677,74 +458,23 @@ bool SLogicOscilloscope::AcquireData()
 		int64_t expUs = (int64_t)((double)mdepth / (double)srate * 1e6);
 		guardUs = max<int64_t>(guardUs, expUs * 4 + 2000000);
 	}
-	while(!m_captureDone && !m_captureAbort && m_triggerArmed)
+	bool stopped = false;
+	while(slogic_capture_poll(cap, 8, 10) == SLOGIC_CAP_RUNNING)
 	{
-		if(m_restartPending)
+		if(!stopped && (m_captureAbort || !m_triggerArmed || (MonotonicUs() - startUs) > guardUs))
 		{
-			//Stall re-arm on this thread: stop -> cancel + wait for the ring to fully drain
-			//-> reset -> clear the endpoint halt/toggle -> configure -> resubmit -> run.
-			//The full reset plus clear_halt is what makes the U3 stream restart reliably (a
-			//bare RUN, or reset without clearing the host toggle, leaves the endpoint dead).
-			LogWarning("SLogic: stream stalled, re-arming capture\n");
-			slogic_stop(m_model, &m_transport);
-			for(auto* x : m_ring)
-				libusb_cancel_transfer(x);
-			int64_t d0 = MonotonicUs();
-			while((m_inFlight > 0) && ((MonotonicUs()-d0) < 500000))
-				this_thread::sleep_for(chrono::milliseconds(1));
-			m_restartPending = false;
-			m_inFlight = 0;
-
-			bool rearmOk = (slogic_reset(m_model, &m_transport) == SLOGIC_OK);
-			if(rearmOk)
-				libusb_clear_halt(m_devh, m_model->ep_in);
-			if(rearmOk && (slogic_configure(m_model, &m_transport, &m_captureCfg) != SLOGIC_OK))
-				rearmOk = false;
-			if(rearmOk)
-			{
-				for(int i=0; i<ring; i++)
-				{
-					m_ring[i]->actual_length = 0;
-					if(libusb_submit_transfer(m_ring[i]) == 0)
-						m_inFlight++;
-				}
-				if(slogic_run(m_model, &m_transport, &m_captureCfg) != SLOGIC_OK)
-					rearmOk = false;
-			}
-			if(!rearmOk)
-				m_captureAbort = true;
-		}
-		this_thread::sleep_for(chrono::milliseconds(1));
-		if((MonotonicUs() - startUs) > guardUs)
-		{
-			LogWarning("SLogic: capture guard timeout (%lld ms, got %zu/%llu bytes) — aborting\n",
-				(long long)(guardUs / 1000), m_captureBuf.size(), (unsigned long long)m_captureNeed);
-			m_captureAbort = true;
+			if((MonotonicUs() - startUs) > guardUs)
+				LogWarning("SLogic: capture guard timeout (%lld ms) — stopping\n",
+					(long long)(guardUs / 1000));
+			slogic_capture_stop(cap);
+			stopped = true;
 		}
 	}
+	slogic_report rep;
+	slogic_capture_report(cap, &rep);
+	slogic_capture_destroy(cap);	//the core already logged its slogic-report line
 
-	//Log why the wait ended (done / stopped-by-UI / aborted) so a freeze shows its last state.
-	LogDebug("SLogic: capture wait ended (done=%d, abort=%d, armed=%d, got=%zu/%llu)\n",
-		(int)m_captureDone, (int)m_captureAbort, (int)m_triggerArmed,
-		m_captureBuf.size(), (unsigned long long)m_captureNeed);
-
-	//Stop the device, then cancel + free the ring. As in libsigrok slogic_dev_stop:
-	//U3 issues CTRL=STOP; Combo 8 has no reliable stop, so draining the EP is its stop.
-	if(m_model->proto == SLOGIC_PROTO_COMBO8)
-		DrainEndpoint();
-	else
-		slogic_stop(m_model, &m_transport);
-	for(auto* x : m_ring)
-		libusb_cancel_transfer(x);
-	int64_t d1 = MonotonicUs();
-	while((m_inFlight > 0) && ((MonotonicUs()-d1) < 500000))
-		this_thread::sleep_for(chrono::milliseconds(1));
-	for(auto* x : m_ring)
-		libusb_free_transfer(x);
-	m_ring.clear();
-	m_ringBufs.clear();
-
-	if(m_captureBuf.size() < (size_t)unit)
+	if(rep.end == SLOGIC_END_ERROR || m_captureBuf.size() < unit)
 		return false;
 
 	ReshapeAndQueue();

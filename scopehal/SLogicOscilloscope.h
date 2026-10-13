@@ -49,7 +49,6 @@ extern "C" {
 
 #include <libusb-1.0/libusb.h>
 
-#include <thread>
 #include <atomic>
 #include <mutex>
 #include <map>
@@ -199,69 +198,37 @@ protected:
 	///@brief Digital channel banks
 	std::vector<DigitalBank> m_digitalBanks;
 
-	///@brief libusb context (unused in the scaffold; owned once the native path lands)
+	///@brief libusb context owned by this driver
 	libusb_context* m_usbctx = nullptr;
 
-	///@brief libusb device handle (unused in the scaffold)
-	libusb_device_handle* m_devh = nullptr;
+	///@brief Open device in the shared libslogic core (owns the handle, event thread and ring)
+	slogic_dev* m_sdev = nullptr;
 
-	///@brief Model descriptor from the vendored slogic core (unused in the scaffold)
+	///@brief Model descriptor from the vendored slogic core
 	const slogic_model* m_model = nullptr;
 
-	///@brief Number of channels on the connected device (unused in the scaffold)
+	///@brief Number of channels in the current capture width
 	int m_channelCount = 0;
 
-	///@brief Set of analog channel group indices (unused in the scaffold)
+	///@brief Set of analog channel group indices
 	std::set<size_t> m_analogGroups;
 
 	///@brief Capture pattern (SLOGIC_PATTERN_*), surfaced via the Pattern selector
 	int m_patternMode = SLOGIC_PATTERN_NORMAL;
 
-	///@brief slogic core transport (control-transfer callbacks bound to libusb)
-	slogic_transport m_transport;
-
-	///@brief Dedicated libusb event-handling thread
-	std::thread m_eventThread;
-
-	///@brief Run flag for the libusb event thread
-	std::atomic<bool> m_eventThreadRun{false};
-
-	///@brief Serializes control transfers against the bulk/event path
-	std::mutex m_transportMutex;
-
-	//Acquisition (Step 4): in-process finite capture via a libusb async bulk ring
-	//driven by the event thread, using the slogic core's transfer plan + first-drop
-	//+ stall watchdog. Software trigger scan / pretrigger crop is Step 5.
-	///@brief slogic per-capture config
+	//Acquisition: one finite capture per AcquireData() through the libslogic capture
+	//engine; the engine delivers exact, sample-major samples (1 byte/sample below 8 ch).
+	///@brief slogic config of the last capture (ReshapeAndQueue reads its channel count)
 	slogic_config m_captureCfg;
-	///@brief slogic per-transfer plan (size/ring/timeout)
-	slogic_transfer_plan m_plan;
-	///@brief slogic stall/first-drop bookkeeping for the current capture
-	slogic_stream m_stream;
-	///@brief Accumulated (post first-drop) capture bytes, sample-major
+	///@brief Captured samples, sample-major, unitsize max(1, ch/8) bytes each
 	std::vector<uint8_t> m_captureBuf;
-	///@brief Target capture length in bytes (m_mdepth * unitsize)
-	uint64_t m_captureNeed = 0;
-	///@brief Protects m_captureBuf against the bulk callback
-	std::mutex m_captureMutex;
-	///@brief Set by the callback when m_captureNeed bytes are in hand
-	std::atomic<bool> m_captureDone{false};
-	///@brief Set on a fatal transfer error / watchdog ABORT
+	///@brief Set by Stop() to end an in-progress capture
 	std::atomic<bool> m_captureAbort{false};
-	///@brief Watchdog RETRY_RUN: session thread re-arms the device once
-	std::atomic<bool> m_restartPending{false};
-	///@brief Number of URBs currently in flight
-	std::atomic<int> m_inFlight{0};
-	///@brief Monotonic microsecond timestamp of the previous transfer completion
-	int64_t m_lastXferUs = 0;
-	///@brief The libusb bulk transfer ring + its backing buffers
-	std::vector<struct libusb_transfer*> m_ring;
-	std::vector<std::vector<uint8_t>> m_ringBufs;
 
-	///@brief libusb bulk completion callback (dispatches to OnTransfer)
-	static void LIBUSB_CALL BulkCallback(struct libusb_transfer* xfer);
-	///@brief Per-transfer handler: first-drop, append, watchdog, resubmit
-	void OnTransfer(struct libusb_transfer* xfer);
+	///@brief Engine sink: append delivered samples to m_captureBuf
+	static int OnSamples(void* user, const uint8_t* samples, size_t n, unsigned unitsize);
+	///@brief Engine log -> scopehal log
+	static void OnLog(void* user, int level, const char* msg);
 	///@brief Reshape m_captureBuf (sample-major) into scopehal waveforms and queue them
 	void ReshapeAndQueue();
 	///@brief Scan m_captureBuf for the active EdgeTrigger's edge; returns trigger sample index or -1 (none)
@@ -269,23 +236,10 @@ protected:
 	///@brief Monotonic clock in microseconds
 	static int64_t MonotonicUs();
 
-	//USB layer (Step 2)
-	///@brief slogic_transport control_write callback → libusb_control_transfer (OUT)
-	static int CtrlWrite(void* ctx, uint8_t bRequest, uint16_t wValue,
-		uint16_t wIndex, const uint8_t* data, uint16_t len, unsigned timeoutMs);
-	///@brief slogic_transport control_read callback → libusb_control_transfer (IN)
-	static int CtrlRead(void* ctx, uint8_t bRequest, uint16_t wValue,
-		uint16_t wIndex, uint8_t* data, uint16_t len, unsigned timeoutMs);
-	///@brief Bind m_transport to this instance's libusb handle
-	void BindTransport();
-	///@brief Enumerate + open the first matching SLogic USB device (optionally by serial); claim iface 0, start the event thread, reset
+	///@brief Find + open the first SLogic (optionally by serial) through the core
 	bool OpenDevice(const std::string& serial = "");
-	///@brief Stop the event thread, release the interface and close the device
+	///@brief Close the device (destroys a live capture) and the libusb context
 	void CloseDevice();
-	///@brief Read + discard any stale bytes left in the bulk IN endpoint between captures
-	void DrainEndpoint();
-	///@brief libusb event loop body
-	void EventThreadFunc();
 
 public:
 	static std::string GetDriverNameInternal();
