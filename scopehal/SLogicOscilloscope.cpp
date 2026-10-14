@@ -143,7 +143,9 @@ bool SLogicOscilloscope::OpenDevice(const string& serial)
 
 	m_model = slogic_dev_model(m_sdev);
 	m_channelCount = m_model->physical_channels;
-	SCPIDevice::m_model = m_model->name;
+	//"(10G) SLogic32U3": link tag first so it survives a truncated name
+	const char* tag = slogic_link_tag(slogic_dev_link(m_sdev));
+	SCPIDevice::m_model = tag ? (string("(") + tag + ") " + m_model->name) : string(m_model->name);
 	m_serial = sbuf;
 
 	//Pick sensible defaults, snapped to the nearest advertised value so
@@ -998,7 +1000,8 @@ vector<uint64_t> SLogicOscilloscope::GetSampleRatesNonInterleaved()
 	vector<uint64_t> ret;
 	if(!m_model)
 		return ret;
-	uint64_t ceil = slogic_max_rate(m_model, m_channelCount);
+	uint64_t ceil = m_sdev ? slogic_link_max_rate(m_model, m_channelCount, slogic_dev_link(m_sdev))
+		: slogic_max_rate(m_model, m_channelCount);
 	for(size_t i = 0; i < m_model->rate_count; i++)
 	{
 		uint64_t r = m_model->rates[i];
@@ -1181,7 +1184,13 @@ vector<slogic_rate_limit> SLogicOscilloscope::CaptureWidthOptions()
 	if(!m_model)
 		return opts;
 	for(size_t i=0; i<m_model->limit_count; i++)
-		opts.push_back(m_model->limits[i]);
+	{
+		//Ceiling for this channel mode on the current link (32U3 on 5G: 4ch@800 ...)
+		slogic_rate_limit l = m_model->limits[i];
+		if(m_sdev)
+			l.max_rate_hz = slogic_link_max_rate(m_model, l.channels, slogic_dev_link(m_sdev));
+		opts.push_back(l);
+	}
 	sort(opts.begin(), opts.end(),
 		[](const slogic_rate_limit& a, const slogic_rate_limit& b) { return a.channels > b.channels; });
 	return opts;
