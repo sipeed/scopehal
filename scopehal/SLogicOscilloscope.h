@@ -135,6 +135,10 @@ public:
 	virtual bool IsChannelGroupAnalog(size_t group) override;
 	virtual void SetChannelGroupAnalog(size_t group, bool analog) override;
 	virtual std::vector<size_t> GetChannelGroupChannelIndices(size_t group) override;
+	virtual bool IsAnalogBitOrderConfigurable() override;
+	virtual std::vector<std::string> GetAnalogBitOrderNames() override;
+	virtual size_t GetAnalogBitOrder() override;
+	virtual void SetAnalogBitOrder(size_t order) override;
 	virtual std::vector<AnalogBank> GetAnalogBanks() override;
 	virtual AnalogBank GetAnalogBank(size_t channel) override;
 
@@ -215,6 +219,15 @@ protected:
 
 	///@brief Capture pattern (SLOGIC_PATTERN_*), surfaced via the Pattern selector
 	int m_patternMode = SLOGIC_PATTERN_NORMAL;
+
+	///@brief Analog group bit order: ADC_ORDER_AUTO / ADC_ORDER_MSB_FIRST / ADC_ORDER_LSB_FIRST
+	size_t m_adcBitOrder = 0;
+
+	///@brief True when an analog group's CH0 carries the ADC MSB (resolves ADC_ORDER_AUTO)
+	bool AdcMsbFirst();
+
+	///@brief True when any byte-group is shown as analog (an ADC is attached)
+	bool AnyAnalogGroup();
 
 	//Acquisition: one finite capture per AcquireData() through the libslogic capture
 	//engine; the engine delivers exact, sample-major samples (1 byte/sample below 8 ch).

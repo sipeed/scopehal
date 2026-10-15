@@ -956,6 +956,26 @@ bool Oscilloscope::IsChannelGroupAnalog(size_t /*group*/)
 	return false;
 }
 
+bool Oscilloscope::IsAnalogBitOrderConfigurable()
+{
+	return false;
+}
+
+vector<string> Oscilloscope::GetAnalogBitOrderNames()
+{
+	return vector<string>();
+}
+
+size_t Oscilloscope::GetAnalogBitOrder()
+{
+	return 0;
+}
+
+void Oscilloscope::SetAnalogBitOrder(size_t /*order*/)
+{
+	//no-op
+}
+
 void Oscilloscope::SetChannelGroupAnalog(size_t /*group*/, bool /*analog*/)
 {
 	//no-op

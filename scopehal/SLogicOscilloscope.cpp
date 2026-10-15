@@ -66,6 +66,37 @@ static const char* const g_slogicDigitalColors[8] =
 static const float g_slogicAnalogVfs  = 15.0f;	//±full scale (volts)
 static const float g_slogicAnalogSpan = 30.0f;	//total span, g_slogicAnalogVfs * 2
 
+//ADC value of a byte-group. The current ADC module wires its data bus MSB first: pin CH0 of the
+//group carries ADC D7 and CH7 carries D0, so the captured byte is bit-reversed relative to the ADC
+//output (msbFirst). The on-device test patterns are generated LSB on CH0. Only the analog view uses
+//this; the digital D<8g+k> channels always show the pins as wired.
+static uint8_t AdcValue(uint8_t pins, bool msbFirst)
+{
+	if(!msbFirst)
+		return pins;
+	pins = (uint8_t)((pins & 0xF0) >> 4 | (pins & 0x0F) << 4);
+	pins = (uint8_t)((pins & 0xCC) >> 2 | (pins & 0x33) << 2);
+	return (uint8_t)((pins & 0xAA) >> 1 | (pins & 0x55) << 1);
+}
+
+enum
+{
+	ADC_ORDER_AUTO,			//MSB first for real input (Normal), LSB first for the test patterns
+	ADC_ORDER_MSB_FIRST,	//CH0 = ADC D7
+	ADC_ORDER_LSB_FIRST,	//CH0 = ADC D0
+	ADC_ORDER_COUNT
+};
+
+//Analog trigger hysteresis in ADC counts (1 count = 30 V / 255 = ~118 mV before attenuation). A
+//rising trigger is armed only after the value has been at least this far below the level, a
+//falling one only after it has been this far above, so noise around the level on the opposite
+//edge cannot fire it.
+static const int g_slogicAdcTrigHysteresis = 4;
+
+//While an ADC is attached (any analog group) the sample clock must come from the 800 MHz PLL that
+//also clocks the ADC; the 1400 MHz PLL's phase is unrelated to it.
+static const unsigned g_slogicAdcClockBaseMhz = 800;
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Construction / destruction
 
@@ -416,6 +447,7 @@ bool SLogicOscilloscope::AcquireData()
 	uint64_t srate, mdepth;
 	int chanCount, pattern;
 	double vth = 1.6;
+	bool adcClock = false;	//SLogic32U3 with an ADC attached: pin the sample clock to its PLL
 	{
 		lock_guard<recursive_mutex> lock(m_mutex);
 		srate = m_srate;
@@ -423,6 +455,7 @@ bool SLogicOscilloscope::AcquireData()
 		chanCount = m_channelCount;
 		pattern = m_patternMode;
 		vth = m_digitalThreshold;	//single global comparator threshold for all digital inputs
+		adcClock = AnyAnalogGroup() && (m_model->pid == SLOGIC_PID_32U3);
 	}
 
 	unsigned unit = slogic_unitsize(chanCount);
@@ -436,6 +469,7 @@ bool SLogicOscilloscope::AcquireData()
 	cfg.dev.samplerate_hz = srate;
 	cfg.dev.threshold_v = vth;
 	cfg.dev.pattern_mode = pattern;
+	cfg.dev.clock_base_mhz = adcClock ? g_slogicAdcClockBaseMhz : 0;
 	cfg.limit_samples = mdepth;
 	cfg.sink.user = this;
 	cfg.sink.data = &SLogicOscilloscope::OnSamples;
@@ -539,35 +573,38 @@ int64_t SLogicOscilloscope::FindTriggerSample(int unit)
 		if(atten == 0.0f)
 			atten = 1.0f;
 		int rawi = (int)((((lv / atten) + g_slogicAnalogVfs) / g_slogicAnalogSpan) * 255.0f + 0.5f);
-		rawi = std::max(0, std::min(255, rawi));
-		uint8_t thresh = (uint8_t)rawi;
+		int thresh = std::max(0, std::min(255, rawi));
+		bool msbFirst = AdcMsbFirst();
 
-		auto getVal = [&](uint64_t s) -> uint8_t { return m_captureBuf[s * (size_t)unit + byteOffset]; };
+		auto getVal = [&](uint64_t s) -> int
+			{ return AdcValue(m_captureBuf[s * (size_t)unit + byteOffset], msbFirst); };
 
-		bool prevAbove = false;
-		uint64_t start = 0;
-		if(m_lastTrigState >= 0)
-			prevAbove = (m_lastTrigState != 0);
-		else if(numSamples < 2)
+		//Crossing with hysteresis: a rising crossing (value reaches the level) counts only after
+		//the value was at or below level - H since the last crossing, a falling one only after it
+		//was at or above level + H. Each capture is scanned on its own (captures are not contiguous).
+		const int h = g_slogicAdcTrigHysteresis;
+		bool risingArmed = false;
+		bool fallingArmed = false;
+		for(uint64_t i = 0; i < numSamples; i++)
 		{
-			m_lastTrigState = (getVal(numSamples - 1) >= thresh) ? 1 : 0;
-			return -1;
-		}
-		else
-		{
-			prevAbove = (getVal(0) >= thresh);
-			start = 1;
-		}
-		for(uint64_t i = start; i < numSamples; i++)
-		{
-			bool cur = (getVal(i) >= thresh);
-			if(cur != prevAbove)
+			int v = getVal(i);
+			if(v <= thresh - h)
+				risingArmed = true;
+			if(v >= thresh + h)
+				fallingArmed = true;
+			bool rising = risingArmed && (v >= thresh);
+			bool falling = fallingArmed && (v < thresh);
+			if((rising && matched(true)) || (falling && matched(false)))
 			{
-				if(matched(cur)) { found = (int64_t)i; break; }
-				prevAbove = cur;
+				found = (int64_t)i;
+				break;
 			}
+			if(rising)
+				risingArmed = false;
+			if(falling)
+				fallingArmed = false;
 		}
-		m_lastTrigState = (getVal(numSamples - 1) >= thresh) ? 1 : 0;
+		m_lastTrigState = -1;
 	}
 	else
 	{
@@ -690,6 +727,7 @@ void SLogicOscilloscope::ReshapeAndQueue()
 			(unsigned long long)numSamples, capCount);
 
 	//Analog groups are always dense and cheap; fill them inline.
+	bool msbFirst = AdcMsbFirst();
 	for(auto& g : layout)
 	{
 		if(!g.analog)
@@ -703,7 +741,7 @@ void SLogicOscilloscope::ReshapeAndQueue()
 		cap->Resize(numSamples);
 		for(uint64_t i=0; i<numSamples; i++)
 		{
-			uint8_t byteval = m_captureBuf[(size_t)(startSample + i) * unit + g.byteOffset];
+			uint8_t byteval = AdcValue(m_captureBuf[(size_t)(startSample + i) * unit + g.byteOffset], msbFirst);
 			//Fixed physical mapping (0..255 -> -15..+15 V) scaled by the probe attenuation, and
 			//independent of the display range so vertical zoom rescales the view, not the data.
 			cap->m_samples[i] = (-g_slogicAnalogVfs + (byteval / 255.0f) * g_slogicAnalogSpan) * g.atten;
@@ -1002,11 +1040,17 @@ vector<uint64_t> SLogicOscilloscope::GetSampleRatesNonInterleaved()
 		return ret;
 	uint64_t ceil = m_sdev ? slogic_link_max_rate(m_model, m_channelCount, slogic_dev_link(m_sdev))
 		: slogic_max_rate(m_model, m_channelCount);
+	//With an ADC attached the sample clock is pinned to the 800 MHz PLL (see AcquireData), so only
+	//rates that PLL can divide down to are offered (on the SLogic32U3 this drops 1400 MHz).
+	bool adcClock = AnyAnalogGroup() && (m_model->pid == SLOGIC_PID_32U3);
 	for(size_t i = 0; i < m_model->rate_count; i++)
 	{
 		uint64_t r = m_model->rates[i];
-		if(!ceil || (r <= ceil))
-			ret.push_back(r);
+		if(ceil && (r > ceil))
+			continue;
+		if(adcClock && (SLOGIC_MHZ(g_slogicAdcClockBaseMhz) % r != 0))
+			continue;
+		ret.push_back(r);
 	}
 	return ret;
 }
@@ -1170,6 +1214,57 @@ void SLogicOscilloscope::SetPatternMode(size_t mode)
 		LogDebug("SLogic: SetPatternMode(%zu = %s)\n", mode,
 			(mode < (size_t)SLOGIC_PATTERN_COUNT) ? slogic_pattern_names[mode] : "?");
 	}
+}
+
+//Analog group bit order. Auto: the ADC module is wired MSB first (CH0 = D7), while the on-device
+//test patterns count LSB first on CH0, so Auto follows the pattern mode.
+bool SLogicOscilloscope::IsAnalogBitOrderConfigurable()
+{
+	return true;
+}
+
+vector<string> SLogicOscilloscope::GetAnalogBitOrderNames()
+{
+	return {
+		"Auto (Normal: CH0 = MSB, test patterns: CH0 = LSB)",
+		"CH0 = MSB (D7..D0)",
+		"CH0 = LSB (D0..D7)",
+	};
+}
+
+size_t SLogicOscilloscope::GetAnalogBitOrder()
+{
+	lock_guard<recursive_mutex> lock(m_mutex);
+	return m_adcBitOrder;
+}
+
+void SLogicOscilloscope::SetAnalogBitOrder(size_t order)
+{
+	lock_guard<recursive_mutex> lock(m_mutex);
+	if(order < (size_t)ADC_ORDER_COUNT)
+		m_adcBitOrder = order;
+	LogDebug("SLogic: SetAnalogBitOrder(%zu)\n", order);
+}
+
+bool SLogicOscilloscope::AdcMsbFirst()
+{
+	lock_guard<recursive_mutex> lock(m_mutex);
+	if(m_adcBitOrder == ADC_ORDER_MSB_FIRST)
+		return true;
+	if(m_adcBitOrder == ADC_ORDER_LSB_FIRST)
+		return false;
+	return m_patternMode == SLOGIC_PATTERN_NORMAL;
+}
+
+bool SLogicOscilloscope::AnyAnalogGroup()
+{
+	lock_guard<recursive_mutex> lock(m_mutex);
+	for(size_t g : m_analogGroups)
+	{
+		if((g*8 + 8) <= (size_t)m_channelCount)
+			return true;
+	}
+	return false;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

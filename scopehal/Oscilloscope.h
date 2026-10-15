@@ -817,6 +817,29 @@ public:
 	 */
 	virtual std::vector<size_t> GetChannelGroupChannelIndices(size_t group);
 
+	/**
+		@brief Returns true if the bit order of analog channel groups can be selected, false otherwise.
+
+		An analog group reads its pins as one binary value; the selection says which pin carries the
+		most significant bit (e.g. an ADC wired MSB first). Instrument-global, like the pattern mode.
+	 */
+	virtual bool IsAnalogBitOrderConfigurable();
+
+	/**
+		@brief Gets the names of the available analog bit orders.
+	 */
+	virtual std::vector<std::string> GetAnalogBitOrderNames();
+
+	/**
+		@brief Gets the current analog bit order index.
+	 */
+	virtual size_t GetAnalogBitOrder();
+
+	/**
+		@brief Sets the analog bit order index.
+	 */
+	virtual void SetAnalogBitOrder(size_t order);
+
 	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	// Logic analyzer configuration
 
