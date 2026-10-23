@@ -97,6 +97,9 @@ static const int g_slogicAdcTrigHysteresis = 4;
 //also clocks the ADC; the 1400 MHz PLL's phase is unrelated to it.
 static const unsigned g_slogicAdcClockBaseMhz = 800;
 
+//The ADC module needs at least this sample rate; lower rates are not offered while it is attached.
+static const uint64_t g_slogicAdcMinRate = 100000000ULL;
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Construction / destruction
 
@@ -198,7 +201,8 @@ bool SLogicOscilloscope::OpenDevice(const string& serial)
 		};
 		auto rates = GetSampleRatesNonInterleaved();
 		auto depths = GetSampleDepthsNonInterleaved();
-		m_srate = nearest(rates, 40000000ULL);		//40 MS/s
+		//SLogic32U3 opens at 32 ch / 100 MS/s, ready for the ADC module
+		m_srate = nearest(rates, (m_model->pid == SLOGIC_PID_32U3) ? 100000000ULL : 40000000ULL);
 		m_mdepth = nearest(depths, 100000ULL);		//100 kS
 	}
 
@@ -924,6 +928,29 @@ void SLogicOscilloscope::LoadConfiguration(int version, const YAML::Node& node, 
 {
 	//Call the base class to configure everything
 	Oscilloscope::LoadConfiguration(version, node, table);
+
+	//A session saved with a rate the current layout no longer offers (e.g. < 100 MS/s with the ADC)
+	SnapSampleRate();
+}
+
+//Move m_srate to the nearest advertised rate if the current one is no longer offered.
+void SLogicOscilloscope::SnapSampleRate()
+{
+	lock_guard<recursive_mutex> lock(m_mutex);
+	auto rates = GetSampleRatesNonInterleaved();
+	if(rates.empty() || (find(rates.begin(), rates.end(), m_srate) != rates.end()))
+		return;
+	uint64_t best = rates[0];
+	for(auto r : rates)
+	{
+		uint64_t d = (r > m_srate) ? (r - m_srate) : (m_srate - r);
+		uint64_t bd = (best > m_srate) ? (best - m_srate) : (m_srate - best);
+		if(d < bd)
+			best = r;
+	}
+	LogDebug("SLogic: sample rate %llu not offered, using %llu\n",
+		(unsigned long long)m_srate, (unsigned long long)best);
+	m_srate = best;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1041,8 +1068,10 @@ vector<uint64_t> SLogicOscilloscope::GetSampleRatesNonInterleaved()
 	uint64_t ceil = m_sdev ? slogic_link_max_rate(m_model, m_channelCount, slogic_dev_link(m_sdev))
 		: slogic_max_rate(m_model, m_channelCount);
 	//With an ADC attached the sample clock is pinned to the 800 MHz PLL (see AcquireData), so only
-	//rates that PLL can divide down to are offered (on the SLogic32U3 this drops 1400 MHz).
+	//rates that PLL can divide down to are offered (on the SLogic32U3 this drops 1400 MHz), and none
+	//below the ADC module's minimum unless the link cannot reach it (then keep what the link allows).
 	bool adcClock = AnyAnalogGroup() && (m_model->pid == SLOGIC_PID_32U3);
+	vector<uint64_t> slow;
 	for(size_t i = 0; i < m_model->rate_count; i++)
 	{
 		uint64_t r = m_model->rates[i];
@@ -1050,9 +1079,12 @@ vector<uint64_t> SLogicOscilloscope::GetSampleRatesNonInterleaved()
 			continue;
 		if(adcClock && (SLOGIC_MHZ(g_slogicAdcClockBaseMhz) % r != 0))
 			continue;
-		ret.push_back(r);
+		if(adcClock && (r < g_slogicAdcMinRate))
+			slow.push_back(r);
+		else
+			ret.push_back(r);
 	}
-	return ret;
+	return ret.empty() ? slow : ret;
 }
 
 vector<uint64_t> SLogicOscilloscope::GetSampleRatesInterleaved()
@@ -1358,6 +1390,7 @@ void SLogicOscilloscope::SetCaptureWidth(size_t mode)
 		m_srate = best;
 	}
 
+	SnapSampleRate();	//dropping the last analog group can also change the list
 	RetargetTriggerIfNeeded();
 
 	m_lastTrigState = -1;	//trigger source/width changed: re-baseline the cross-buffer scan
@@ -1389,10 +1422,11 @@ void SLogicOscilloscope::SetChannelGroupAnalog(size_t group, bool analog)
 	else
 		m_analogGroups.erase(group);
 
-	//Analog/digital only changes interpretation of the same captured byte, not the capture width,
-	//so no rate/re-plan change is needed — just re-enable channels and refresh banks + trigger.
+	//Analog/digital only changes interpretation of the same captured byte, not the capture width;
+	//only the offered rates change (ADC clock and minimum rate), so snap the rate to them.
 	ApplyChannelEnables();
 	RebuildBanks();
+	SnapSampleRate();
 	RetargetTriggerIfNeeded();
 	m_lastTrigState = -1;
 	LogDebug("SLogic: SetChannelGroupAnalog(group=%zu, %s)\n", group, analog ? "analog" : "digital");

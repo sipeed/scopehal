@@ -229,6 +229,9 @@ protected:
 	///@brief True when any byte-group is shown as analog (an ADC is attached)
 	bool AnyAnalogGroup();
 
+	///@brief Move the sample rate to the nearest advertised one when the current one is not offered
+	void SnapSampleRate();
+
 	//Acquisition: one finite capture per AcquireData() through the libslogic capture
 	//engine; the engine delivers exact, sample-major samples (1 byte/sample below 8 ch).
 	///@brief slogic config of the last capture (ReshapeAndQueue reads its channel count)
