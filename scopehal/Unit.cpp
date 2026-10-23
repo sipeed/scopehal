@@ -492,7 +492,13 @@ void Unit::GetUnitSuffix(UnitType type, double num, double& scaleFactor, string&
 		case UNIT_MICROVOLTS:
 			suffix = "V";
 
-			if(fabs(num) >= 1e12)
+			//Zero (e.g. the center tick of an X-Y or constellation plot) reads "0 V", not "0 μV"
+			if(fabs(num) < 0.5)
+			{
+				scaleFactor = 1e-6;
+				prefix = "";
+			}
+			else if(fabs(num) >= 1e12)
 			{
 				scaleFactor = 1e-12;
 				prefix = "M";

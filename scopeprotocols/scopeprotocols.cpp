@@ -245,5 +245,6 @@ void ScopeProtocolStaticInit()
 	AddDecoderClass(WFMImportFilter);
 	AddDecoderClass(WindowedAutocorrelationFilter);
 	AddDecoderClass(WindowFilter);
+	AddDecoderClass(XYFilter);
 	AddDecoderClass(XYSweepFilter);
 }
