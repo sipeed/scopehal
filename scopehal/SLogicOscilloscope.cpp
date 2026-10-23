@@ -772,14 +772,21 @@ void SLogicOscilloscope::ReshapeAndQueue()
 	vector<int64_t*> sdur(totalCh, nullptr);
 
 	//Phase 1 (parallel): count transitions -> sparse run count, one scan per byte column.
+	//ngscopeclient draws a sparse digital sample up to the next one and ignores durations, so the
+	//last run would not be drawn and a channel without edges (one run) not at all. Each sparse
+	//waveform therefore ends with a terminator: one more sample at the last sample position with
+	//the same level, unless the last run is already only that one sample.
+	vector<uint8_t> term(totalCh, 0);
 	auto countGroup = [&](const Grp& g)
 	{
 		uint8_t prev[8];
 		uint64_t r[8];
+		uint64_t last[8];
 		for(size_t k=0; k<g.nbits; k++)
 		{
 			prev[k] = (buf[base0 + g.byteOffset] >> k) & 1;
 			r[k] = 1;
+			last[k] = 0;
 		}
 		for(uint64_t i=1; i<numSamples; i++)
 		{
@@ -791,11 +798,15 @@ void SLogicOscilloscope::ReshapeAndQueue()
 				{
 					r[k]++;
 					prev[k] = bit;
+					last[k] = i;
 				}
 			}
 		}
 		for(size_t k=0; k<g.nbits; k++)
-			runs[g.firstChannel + k] = r[k];
+		{
+			term[g.firstChannel + k] = (last[k] + 1 < numSamples) ? 1 : 0;
+			runs[g.firstChannel + k] = r[k] + term[g.firstChannel + k];
+		}
 	};
 	{
 		vector<thread> workers;
@@ -883,9 +894,17 @@ void SLogicOscilloscope::ReshapeAndQueue()
 				dense[idx]->MarkSamplesModifiedFromCpu();
 			else
 			{
+				//Final run, then the terminator (see phase 1) so the run is drawn to the end
+				int64_t end = (int64_t)numSamples - (term[idx] ? 1 : 0);
 				soff[idx][sr[k]] = sstart[k];
-				sdur[idx][sr[k]] = (int64_t)numSamples - sstart[k];
+				sdur[idx][sr[k]] = end - sstart[k];
 				sparse[idx]->m_samples[sr[k]] = sprev[k] ? true : false;
+				if(term[idx])
+				{
+					soff[idx][sr[k] + 1] = end;
+					sdur[idx][sr[k] + 1] = 1;
+					sparse[idx]->m_samples[sr[k] + 1] = sprev[k] ? true : false;
+				}
 				sparse[idx]->MarkSamplesModifiedFromCpu();
 				sparse[idx]->MarkTimestampsModifiedFromCpu();
 			}
