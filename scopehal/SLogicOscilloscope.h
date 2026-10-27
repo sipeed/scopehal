@@ -252,8 +252,11 @@ protected:
 	///@brief Monotonic clock in microseconds
 	static int64_t MonotonicUs();
 
-	///@brief Find + open the first SLogic (optionally by serial) through the core
-	bool OpenDevice(const std::string& serial = "");
+	///@brief Find + open an SLogic through the core: the one at USB port `port` ("2-3.1"), or the first
+	bool OpenDevice(const std::string& port = "");
+
+	///@brief USB port the instrument was asked for (the connection string), "" for the first SLogic
+	std::string m_port;
 	///@brief Close the device (destroys a live capture) and the libusb context
 	void CloseDevice();
 
@@ -262,13 +265,7 @@ public:
 
 	//This is intentionally not virtual since it's a static method used by enumeration
 	//cppcheck-suppress duplInheritedMember
-	static std::vector<SCPIInstrumentModel> GetDriverSupportedModels()
-	{
-		return
-		{
-			{"SLogic", {{ SCPITransportType::TRANSPORT_NULL, "" }}}
-		};
-	}
+	static std::vector<SCPIInstrumentModel> GetDriverSupportedModels();
 	OSCILLOSCOPE_INITPROC(SLogicOscilloscope)
 };
 

@@ -120,9 +120,17 @@ SLogicOscilloscope::SLogicOscilloscope(SCPITransport* transport)
 	SCPIDevice::m_model = "SLogic";
 	m_serial = "";
 
-	//Open the first attached SLogic device (a specific one can be selected by
-	//serial later via the connection string).
-	if(!OpenDevice())
+	//The connection string is the USB port of the analyzer to open (set by the connect dialog when
+	//several are attached), else the first one. A port that has nothing on it any more (moved
+	//cable, older session) falls back to the first SLogic too.
+	m_port = transport ? transport->GetConnectionString() : "";
+	bool ok = OpenDevice(m_port);
+	if(!ok && !m_port.empty())
+	{
+		LogNotice("SLogicOscilloscope: no SLogic on USB port %s, opening the first one\n", m_port.c_str());
+		ok = OpenDevice();
+	}
+	if(!ok)
 		LogError("SLogicOscilloscope: no SLogic device found / open failed\n");
 }
 
@@ -146,7 +154,7 @@ void SLogicOscilloscope::OnLog(void* /*user*/, int level, const char* msg)
 	}
 }
 
-bool SLogicOscilloscope::OpenDevice(const string& serial)
+bool SLogicOscilloscope::OpenDevice(const string& port)
 {
 	if(libusb_init(&m_usbctx) != LIBUSB_SUCCESS)
 	{
@@ -156,7 +164,7 @@ bool SLogicOscilloscope::OpenDevice(const string& serial)
 	}
 
 	libusb_device* dev = nullptr;
-	if(slogic_find(m_usbctx, 0, nullptr, serial.empty() ? nullptr : serial.c_str(), &dev) != SLOGIC_OK ||
+	if(slogic_find(m_usbctx, 0, port.empty() ? nullptr : port.c_str(), nullptr, &dev) != SLOGIC_OK ||
 		slogic_dev_open(m_usbctx, dev, &SLogicOscilloscope::OnLog, this, &m_sdev) != SLOGIC_OK)
 	{
 		if(dev)
@@ -345,7 +353,58 @@ string SLogicOscilloscope::GetTransportName()
 
 string SLogicOscilloscope::GetTransportConnectionString()
 {
-	return "";
+	return m_port;
+}
+
+/**
+	@brief The attached analyzers, named like the instrument will be ("(10G) SLogic32U3"), for the connect dialog
+
+	The name becomes the default nickname. With several attached, each also carries its USB port, which
+	is the connection string; with one (or none) the string is empty and the first SLogic is opened.
+ */
+vector<SCPIInstrumentModel> SLogicOscilloscope::GetDriverSupportedModels()
+{
+	struct Found
+	{
+		string name;
+		string port;
+	};
+	vector<Found> found;
+
+	libusb_context* ctx = nullptr;
+	if(libusb_init(&ctx) == LIBUSB_SUCCESS)
+	{
+		libusb_device** list = nullptr;
+		ssize_t n = libusb_get_device_list(ctx, &list);
+		for(ssize_t i = 0; i < n; i++)
+		{
+			libusb_device_descriptor des;
+			if(libusb_get_device_descriptor(list[i], &des) != 0 || des.idVendor != SLOGIC_VID)
+				continue;
+			auto model = slogic_model_for_pid(des.idProduct);
+			if(!model)
+				continue;
+			char name[64];
+			char port[64] = {0};
+			slogic_port_path(list[i], port, sizeof(port));
+			found.push_back({slogic_display_name(model, slogic_usb_link(list[i]), name, sizeof(name)), port});
+		}
+		if(n >= 0)
+			libusb_free_device_list(list, 1);
+		libusb_exit(ctx);
+	}
+
+	vector<SCPIInstrumentModel> ret;
+	for(auto& f : found)
+	{
+		if(found.size() == 1)
+			ret.push_back({f.name, {{ SCPITransportType::TRANSPORT_NULL, "" }}});
+		else
+			ret.push_back({f.name + " @ USB " + f.port, {{ SCPITransportType::TRANSPORT_NULL, f.port }}});
+	}
+	if(ret.empty())
+		ret.push_back({"SLogic", {{ SCPITransportType::TRANSPORT_NULL, "" }}});
+	return ret;
 }
 
 ///@brief Return the constant driver name "slogic"
