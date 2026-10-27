@@ -178,8 +178,8 @@ bool SLogicOscilloscope::OpenDevice(const string& serial)
 	m_model = slogic_dev_model(m_sdev);
 	m_channelCount = m_model->physical_channels;
 	//"(10G) SLogic32U3": link tag first so it survives a truncated name
-	const char* tag = slogic_link_tag(slogic_dev_link(m_sdev));
-	SCPIDevice::m_model = tag ? (string("(") + tag + ") " + m_model->name) : string(m_model->name);
+	char name[64];	//"(10G) SLogic32 U3": the same name in every SLogic app
+	SCPIDevice::m_model = slogic_display_name(m_model, slogic_dev_link(m_sdev), name, sizeof(name));
 	m_serial = sbuf;
 
 	//Pick sensible defaults, snapped to the nearest advertised value so
